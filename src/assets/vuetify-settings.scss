@@ -1,0 +1,6 @@
+@use 'vuetify/settings' with (
+  $body-font-family: ('Avenir Next', 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', sans-serif),
+  $border-radius-root: 18px,
+  $button-height: 42px,
+  $field-border-radius: 12px
+);
