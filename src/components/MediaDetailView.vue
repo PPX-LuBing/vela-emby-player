@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, shallowRef, useTemplateRef, watch } from 'vue'
-import { ArrowLeft, ChevronLeft, ChevronRight, Film, Play, Star, Tv, Video } from 'lucide-vue-next'
+import { ArrowLeft, Check, ChevronLeft, ChevronRight, Film, Heart, Play, Star, Tv, Video } from 'lucide-vue-next'
 import type { EmbyItem } from '../composables/useEmbyClient'
 
 const props = defineProps<{
@@ -14,10 +14,13 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   back: []
+  changeFavorite: [payload: { item: EmbyItem; isFavorite: boolean }]
+  changePlayed: [payload: { item: EmbyItem; isPlayed: boolean }]
   play: [item?: EmbyItem]
 }>()
 
 const activeSeasonKey = shallowRef('')
+const showUnplayedOnly = shallowRef(false)
 const episodeRailRef = useTemplateRef<HTMLElement>('episodeRail')
 const isDraggingEpisodes = shallowRef(false)
 const dragStartX = shallowRef(0)
@@ -70,13 +73,30 @@ const activeSeasonGroup = computed(() => {
   )
 })
 
+const activeSeasonEpisodes = computed(() => activeSeasonGroup.value?.episodes ?? [])
+
+const visibleSeasonEpisodes = computed(() => {
+  if (!showUnplayedOnly.value) {
+    return activeSeasonEpisodes.value
+  }
+
+  return activeSeasonEpisodes.value.filter((episode) => !episode.UserData?.Played)
+})
+
+const nextEpisode = computed(() => {
+  return props.episodes
+    .filter((episode) => !episode.UserData?.Played)
+    .sort(compareEpisodesBySeason)
+    .find(Boolean) ?? null
+})
+
 const playableItem = computed(() => {
   if (!props.item) {
     return null
   }
 
   if (props.item.Type === 'Series') {
-    return activeSeasonGroup.value?.episodes[0] ?? props.episodes[0] ?? null
+    return nextEpisode.value ?? visibleSeasonEpisodes.value[0] ?? activeSeasonEpisodes.value[0] ?? props.episodes[0] ?? null
   }
 
   return props.item
@@ -89,6 +109,9 @@ const itemKind = computed(() => {
 
   return props.item?.Type === 'Episode' ? 'Episode' : 'Movie'
 })
+
+const isFavorite = computed(() => Boolean(props.item?.UserData?.IsFavorite))
+const isPlayed = computed(() => Boolean(props.item?.UserData?.Played))
 
 watch(
   seasonGroups,
@@ -138,7 +161,14 @@ function formatSeasonTitle(season: EmbyItem) {
 }
 
 function formatSeasonMeta(group: { episodes: EmbyItem[] }) {
-  return `${group.episodes.length} 集`
+  const unplayedCount = group.episodes.filter((episode) => !episode.UserData?.Played).length
+  return unplayedCount > 0 ? `${group.episodes.length} 集 · ${unplayedCount} 未看` : `${group.episodes.length} 集`
+}
+
+function formatNextEpisode(item: EmbyItem) {
+  const season = item.ParentIndexNumber ? `第 ${item.ParentIndexNumber} 季` : ''
+  const episode = item.IndexNumber ? `第 ${item.IndexNumber} 集` : ''
+  return [season, episode, item.Name].filter(Boolean).join(' · ')
 }
 
 function getSeasonKey(season: EmbyItem) {
@@ -184,9 +214,37 @@ function compareEpisodes(first: EmbyItem, second: EmbyItem) {
   return first.Name.localeCompare(second.Name)
 }
 
+function compareEpisodesBySeason(first: EmbyItem, second: EmbyItem) {
+  const firstSeason = first.ParentIndexNumber ?? 0
+  const secondSeason = second.ParentIndexNumber ?? 0
+  if (firstSeason !== secondSeason) {
+    return firstSeason - secondSeason
+  }
+
+  return compareEpisodes(first, second)
+}
+
 function playSelected() {
   if (playableItem.value) {
     emit('play', playableItem.value)
+  }
+}
+
+function playNextEpisode() {
+  if (nextEpisode.value) {
+    emit('play', nextEpisode.value)
+  }
+}
+
+function toggleFavorite() {
+  if (props.item) {
+    emit('changeFavorite', { item: props.item, isFavorite: !isFavorite.value })
+  }
+}
+
+function togglePlayed() {
+  if (props.item) {
+    emit('changePlayed', { item: props.item, isPlayed: !isPlayed.value })
   }
 }
 
@@ -313,6 +371,47 @@ function playEpisode(episode: EmbyItem) {
             </template>
             {{ item.Type === 'Series' ? '播放第一集' : '播放' }}
           </VBtn>
+          <div class="detail-actions">
+            <VBtn
+              :color="isFavorite ? 'primary' : undefined"
+              :variant="isFavorite ? 'flat' : 'tonal'"
+              type="button"
+              :loading="isBusy"
+              @click="toggleFavorite"
+            >
+              <template #prepend>
+                <Heart :size="17" />
+              </template>
+              {{ isFavorite ? '已收藏' : '收藏' }}
+            </VBtn>
+            <VBtn
+              :color="isPlayed ? 'primary' : undefined"
+              :variant="isPlayed ? 'flat' : 'tonal'"
+              type="button"
+              :loading="isBusy"
+              @click="togglePlayed"
+            >
+              <template #prepend>
+                <Check :size="17" />
+              </template>
+              {{ isPlayed ? '标记未看' : '标记已看' }}
+            </VBtn>
+          </div>
+          <VBtn
+            v-if="item.Type === 'Series' && nextEpisode"
+            class="detail-play detail-play--secondary"
+            variant="tonal"
+            type="button"
+            @click="playNextEpisode"
+          >
+            <template #prepend>
+              <Play :size="18" />
+            </template>
+            播放下一集
+          </VBtn>
+          <p v-if="item.Type === 'Series' && nextEpisode" class="detail-next">
+            {{ formatNextEpisode(nextEpisode) }}
+          </p>
         </div>
       </div>
     </div>
@@ -324,6 +423,20 @@ function playEpisode(episode: EmbyItem) {
           <h3 class="episode-section__title">分季与分集</h3>
         </div>
         <span>{{ isBusy ? '读取中' : `${episodes.length} 集` }}</span>
+      </div>
+
+      <div class="episode-filters">
+        <VBtn
+          :color="showUnplayedOnly ? 'primary' : undefined"
+          :variant="showUnplayedOnly ? 'flat' : 'tonal'"
+          type="button"
+          @click="showUnplayedOnly = !showUnplayedOnly"
+        >
+          <template #prepend>
+            <Check :size="16" />
+          </template>
+          仅看未看
+        </VBtn>
       </div>
 
       <div v-if="seasonGroups.length" class="season-tabs" aria-label="季列表">
@@ -343,7 +456,7 @@ function playEpisode(episode: EmbyItem) {
         </VChip>
       </div>
 
-      <div v-if="activeSeasonGroup?.episodes.length" class="episode-rail-shell">
+      <div v-if="visibleSeasonEpisodes.length" class="episode-rail-shell">
         <VBtn
           class="episode-rail-button episode-rail-button--previous"
           type="button"
@@ -364,10 +477,10 @@ function playEpisode(episode: EmbyItem) {
           @pointerdown="startEpisodeDrag"
           @pointermove="moveEpisodeDrag"
           @pointerup="endEpisodeDrag"
-          @pointercancel="endEpisodeDrag"
+            @pointercancel="endEpisodeDrag"
         >
           <VCard
-            v-for="episode in activeSeasonGroup.episodes"
+            v-for="episode in visibleSeasonEpisodes"
             :key="episode.Id"
             class="episode-tile"
             tag="button"
@@ -385,6 +498,9 @@ function playEpisode(episode: EmbyItem) {
               />
               <Film v-else :size="24" />
               <span class="episode-tile__play"><Play :size="16" /></span>
+              <span v-if="episode.UserData?.Played" class="episode-tile__played">
+                <Check :size="13" />
+              </span>
             </span>
             <span class="episode-tile__body">
               <span class="episode-tile__index">
@@ -540,9 +656,27 @@ function playEpisode(episode: EmbyItem) {
   min-width: 136px;
 }
 
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.detail-play--secondary {
+  margin-top: -4px;
+}
+
 .detail-play:disabled {
   cursor: default;
   opacity: 0.48;
+}
+
+.detail-next {
+  max-width: 42rem;
+  margin: -3px 0 0;
+  color: #c9d7e3;
+  font-size: 0.86rem;
+  line-height: 1.4;
 }
 
 .episode-section {
@@ -572,6 +706,11 @@ function playEpisode(episode: EmbyItem) {
 .episode-section__header span {
   color: var(--color-muted);
   font-size: 0.82rem;
+}
+
+.episode-filters {
+  display: flex;
+  justify-content: end;
 }
 
 .season-tabs {
@@ -731,6 +870,22 @@ function playEpisode(episode: EmbyItem) {
     opacity var(--motion-fast),
     transform var(--motion-fast);
   backdrop-filter: blur(14px);
+}
+
+.episode-tile__played {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  color: #061015;
+  background: var(--color-signal);
+  border: 1px solid rgb(255 255 255 / 42%);
+  border-radius: 999px;
+  box-shadow: 0 8px 20px rgb(0 0 0 / 28%);
 }
 
 .episode-tile:hover .episode-tile__poster {

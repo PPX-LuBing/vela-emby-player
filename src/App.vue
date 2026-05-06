@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, shallowRef } from 'vue'
 import { ArrowLeft, Library, Settings } from 'lucide-vue-next'
-import { useEmbyClient, type EmbyItem, type EmbyLibrary } from './composables/useEmbyClient'
+import {
+  DEFAULT_PLAYBACK_USER_AGENT,
+  useEmbyClient,
+  type EmbyItem,
+  type EmbyLibrary,
+  type LibrarySortKey,
+  type SortOrder,
+} from './composables/useEmbyClient'
 
 type AppView = 'library' | 'detail' | 'player' | 'settings'
 
@@ -16,11 +23,22 @@ const {
   accounts,
   libraries,
   items,
+  itemsTotalCount,
+  resumeItems,
+  latestItems,
+  favoriteItems,
+  searchResults,
+  searchTotalCount,
   seriesSeasons,
   seriesEpisodes,
   selectedItem,
+  playbackPreferences,
+  playbackUserAgent,
   isBusy,
+  librarySortBy,
+  librarySortOrder,
   errorMessage,
+  clearAllLocalAccounts,
   getBackdropUrl,
   getImageUrl,
   getMpvAuthContext,
@@ -28,7 +46,10 @@ const {
   getPlaybackUrl,
   getSubtitleUrl,
   clearSeriesEpisodes,
+  loadHome,
   loadItems,
+  loadMoreItems,
+  loadMoreSearchResults,
   loadSeriesEpisodes,
   login,
   logout,
@@ -37,15 +58,21 @@ const {
   reportPlaybackProgress,
   reportPlaybackStopped,
   restore,
+  searchItems,
   selectItem,
+  setFavorite,
+  setPlayed,
   signOutCurrentOnly,
   switchAccount,
   updateAccount,
+  updatePlaybackPreferences,
+  updatePlaybackUserAgent,
 } = useEmbyClient()
 
 const activeView = shallowRef<AppView>('library')
 const previousView = shallowRef<AppView>('library')
 const playingItem = shallowRef<EmbyItem | null>(null)
+const activeLibrary = shallowRef<EmbyLibrary | null>(null)
 const navigationView = computed(() => (activeView.value === 'settings' ? 'settings' : 'library'))
 const pageTitle = computed(() => {
   if (activeView.value === 'detail') {
@@ -75,7 +102,14 @@ function deleteAccount(accountId: string) {
 }
 
 function disconnectCurrent() {
-  signOutCurrentOnly()
+  signOutCurrentOnly().catch(() => {
+    // The settings view displays shared persistence errors.
+  })
+  activeView.value = 'settings'
+}
+
+async function clearLocalAccounts() {
+  await clearAllLocalAccounts()
   activeView.value = 'settings'
 }
 
@@ -122,9 +156,19 @@ async function openPlayer(item?: EmbyItem) {
   }
 }
 
+async function refreshAfterPlayback() {
+  await Promise.all([
+    loadHome(),
+    activeLibrary.value ? loadItems(activeLibrary.value) : Promise.resolve(),
+  ])
+}
+
 function leavePlayer() {
   playingItem.value = null
   activeView.value = selectedItem.value ? 'detail' : 'library'
+  refreshAfterPlayback().catch(() => {
+    // The shared error state is displayed by the current view.
+  })
 }
 
 function backFromDetail() {
@@ -134,8 +178,44 @@ function backFromDetail() {
 
 async function loadLibraryItems(library: EmbyLibrary) {
   playingItem.value = null
+  activeLibrary.value = library
   await loadItems(library)
   activeView.value = 'library'
+}
+
+async function loadMoreLibraryItems() {
+  if (!activeLibrary.value) {
+    return
+  }
+
+  await loadMoreItems(activeLibrary.value)
+}
+
+async function changeLibrarySort(payload: { sortBy: LibrarySortKey; sortOrder: SortOrder }) {
+  if (!activeLibrary.value) {
+    return
+  }
+
+  await loadItems(activeLibrary.value, payload)
+}
+
+async function refreshAfterUserDataChange(item: EmbyItem) {
+  await Promise.all([
+    loadHome(),
+    activeLibrary.value ? loadItems(activeLibrary.value) : Promise.resolve(),
+    item.Type === 'Series' ? loadSeriesEpisodes(item.Id) : Promise.resolve(),
+    item.Type === 'Episode' && item.SeriesId ? loadSeriesEpisodes(item.SeriesId) : Promise.resolve(),
+  ])
+}
+
+async function changeFavorite(payload: { item: EmbyItem; isFavorite: boolean }) {
+  await setFavorite(payload.item.Id, payload.isFavorite)
+  await refreshAfterUserDataChange(payload.item)
+}
+
+async function changePlayed(payload: { item: EmbyItem; isPlayed: boolean }) {
+  await setPlayed(payload.item.Id, payload.isPlayed)
+  await refreshAfterUserDataChange(payload.item)
 }
 
 onMounted(() => {
@@ -166,6 +246,7 @@ onMounted(() => {
         <PlayerPanel
           :item="playingItem"
           :episodes="seriesEpisodes"
+          :playback-preferences="playbackPreferences"
           :get-playback-info="getPlaybackInfo"
           :get-playback-url="getPlaybackUrl"
           :get-subtitle-url="getSubtitleUrl"
@@ -238,9 +319,21 @@ onMounted(() => {
                 key="library"
                 :libraries="libraries"
                 :items="items"
+                :items-total-count="itemsTotalCount"
+                :resume-items="resumeItems"
+                :latest-items="latestItems"
+                :favorite-items="favoriteItems"
+                :search-results="searchResults"
+                :search-total-count="searchTotalCount"
                 :selected-item="selectedItem"
                 :is-busy="isBusy"
+                :library-sort-by="librarySortBy"
+                :library-sort-order="librarySortOrder"
                 :get-image-url="getImageUrl"
+                @change-sort="changeLibrarySort"
+                @load-more="loadMoreLibraryItems"
+                @load-more-search="loadMoreSearchResults"
+                @search="searchItems"
                 @select-library="loadLibraryItems"
                 @select-item="openItemDetail"
               />
@@ -255,6 +348,8 @@ onMounted(() => {
                 :get-image-url="getImageUrl"
                 :get-backdrop-url="getBackdropUrl"
                 @back="backFromDetail"
+                @change-favorite="changeFavorite"
+                @change-played="changePlayed"
                 @play="openPlayer"
               />
 
@@ -263,14 +358,20 @@ onMounted(() => {
                 key="settings"
                 :session="session"
                 :accounts="accounts"
+                :default-playback-user-agent="DEFAULT_PLAYBACK_USER_AGENT"
                 :is-busy="isBusy"
+                :playback-preferences="playbackPreferences"
+                :playback-user-agent="playbackUserAgent"
                 :error-message="errorMessage"
                 @login="submitLogin"
+                @clear-local-accounts="clearLocalAccounts"
                 @logout="logout"
                 @remove-account="deleteAccount"
                 @sign-out-current-only="disconnectCurrent"
                 @switch-account="selectAccount"
                 @update-account="editAccount"
+                @update-playback-preferences="updatePlaybackPreferences"
+                @update-playback-user-agent="updatePlaybackUserAgent"
               />
             </Transition>
           </section>
