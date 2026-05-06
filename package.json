@@ -8,8 +8,8 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "tauri:dev": "CARGO_HOME=/tmp/emby-new-cargo-home RUSTC=/Users/ice/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc http_proxy=http://127.0.0.1:10808 https_proxy=http://127.0.0.1:10808 all_proxy=socks5://127.0.0.1:10808 HTTP_PROXY=http://127.0.0.1:10808 HTTPS_PROXY=http://127.0.0.1:10808 ALL_PROXY=socks5://127.0.0.1:10808 tauri dev",
-    "tauri:build": "CARGO_HOME=/tmp/emby-new-cargo-home RUSTC=/Users/ice/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc http_proxy=http://127.0.0.1:10808 https_proxy=http://127.0.0.1:10808 all_proxy=socks5://127.0.0.1:10808 HTTP_PROXY=http://127.0.0.1:10808 HTTPS_PROXY=http://127.0.0.1:10808 ALL_PROXY=socks5://127.0.0.1:10808 tauri build && node scripts/sign-macos-app.mjs"
+    "tauri:dev": "node scripts/run-tauri.mjs dev",
+    "tauri:build": "node scripts/run-tauri.mjs build && node scripts/sign-macos-app.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
