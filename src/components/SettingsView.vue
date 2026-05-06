@@ -1,27 +1,38 @@
 <script setup lang="ts">
 import { computed, reactive, shallowRef, watch } from 'vue'
 import { Check, Edit3, LogOut, Plus, Trash2, X } from 'lucide-vue-next'
-import type { EmbySession } from '../composables/useEmbyClient'
+import {
+  PLAYBACK_QUALITY_OPTIONS,
+  type EmbySession,
+  type PlaybackPreferences,
+} from '../composables/useEmbyClient'
 
 type DialogMode = 'add' | 'edit'
 
 const props = defineProps<{
   session: Readonly<EmbySession | null>
   accounts: readonly EmbySession[]
+  defaultPlaybackUserAgent: string
   isBusy: boolean
+  playbackPreferences: Readonly<PlaybackPreferences>
+  playbackUserAgent: string
   errorMessage: string
 }>()
 
 const emit = defineEmits<{
   login: [serverUrl: string, username: string, password: string, displayName?: string]
+  clearLocalAccounts: []
   logout: []
   removeAccount: [accountId: string]
   signOutCurrentOnly: []
   switchAccount: [accountId: string]
   updateAccount: [accountId: string, updates: { displayName: string; serverUrl: string }]
+  updatePlaybackPreferences: [preferences: PlaybackPreferences]
+  updatePlaybackUserAgent: [userAgent: string]
 }>()
 
 const isDialogOpen = shallowRef(false)
+const isClearAccountsDialogOpen = shallowRef(false)
 const dialogMode = shallowRef<DialogMode>('add')
 const editingAccountId = shallowRef('')
 const form = reactive({
@@ -29,6 +40,14 @@ const form = reactive({
   serverUrl: 'http://localhost:8096',
   username: '',
   password: '',
+})
+const userAgentDraft = shallowRef(props.playbackUserAgent)
+const playbackPreferenceDraft = reactive<PlaybackPreferences>({
+  preferredAudioLanguage: props.playbackPreferences.preferredAudioLanguage,
+  preferredSubtitleLanguage: props.playbackPreferences.preferredSubtitleLanguage,
+  defaultForceTranscode: props.playbackPreferences.defaultForceTranscode,
+  defaultQualityPreset: props.playbackPreferences.defaultQualityPreset,
+  customMaxStreamingBitrate: props.playbackPreferences.customMaxStreamingBitrate,
 })
 
 const dialogTitle = computed(() =>
@@ -47,6 +66,24 @@ watch(isDialogOpen, (nextOpen) => {
     editingAccountId.value = ''
   }
 })
+
+watch(
+  () => props.playbackUserAgent,
+  (nextUserAgent) => {
+    userAgentDraft.value = nextUserAgent
+  },
+)
+
+watch(
+  () => props.playbackPreferences,
+  (nextPreferences) => {
+    playbackPreferenceDraft.preferredAudioLanguage = nextPreferences.preferredAudioLanguage
+    playbackPreferenceDraft.preferredSubtitleLanguage = nextPreferences.preferredSubtitleLanguage
+    playbackPreferenceDraft.defaultForceTranscode = nextPreferences.defaultForceTranscode
+    playbackPreferenceDraft.defaultQualityPreset = nextPreferences.defaultQualityPreset
+    playbackPreferenceDraft.customMaxStreamingBitrate = nextPreferences.customMaxStreamingBitrate
+  },
+)
 
 function openAddDialog() {
   dialogMode.value = 'add'
@@ -92,6 +129,39 @@ function formatServer(serverUrl: string) {
   } catch {
     return serverUrl
   }
+}
+
+function savePlaybackUserAgent() {
+  emit('updatePlaybackUserAgent', userAgentDraft.value)
+}
+
+function resetPlaybackUserAgent() {
+  userAgentDraft.value = props.defaultPlaybackUserAgent
+  emit('updatePlaybackUserAgent', props.defaultPlaybackUserAgent)
+}
+
+function savePlaybackPreferences() {
+  emit('updatePlaybackPreferences', {
+    preferredAudioLanguage: playbackPreferenceDraft.preferredAudioLanguage,
+    preferredSubtitleLanguage: playbackPreferenceDraft.preferredSubtitleLanguage,
+    defaultForceTranscode: playbackPreferenceDraft.defaultForceTranscode,
+    defaultQualityPreset: playbackPreferenceDraft.defaultQualityPreset,
+    customMaxStreamingBitrate: playbackPreferenceDraft.customMaxStreamingBitrate,
+  })
+}
+
+function resetPlaybackPreferences() {
+  playbackPreferenceDraft.preferredAudioLanguage = ''
+  playbackPreferenceDraft.preferredSubtitleLanguage = ''
+  playbackPreferenceDraft.defaultForceTranscode = false
+  playbackPreferenceDraft.defaultQualityPreset = 'original'
+  playbackPreferenceDraft.customMaxStreamingBitrate = 12_000_000
+  savePlaybackPreferences()
+}
+
+function confirmClearLocalAccounts() {
+  isClearAccountsDialogOpen.value = false
+  emit('clearLocalAccounts')
 }
 </script>
 
@@ -180,6 +250,129 @@ function formatServer(serverUrl: string) {
       </VSheet>
     </VCard>
 
+    <VCard class="settings-card" variant="flat">
+      <div class="settings-card__heading">
+        <div>
+          <h3>播放请求</h3>
+          <p>自定义 mpv 拉流时使用的 User-Agent。</p>
+        </div>
+      </div>
+
+      <div class="playback-agent-form">
+        <VTextField
+          v-model.trim="userAgentDraft"
+          label="播放 User-Agent"
+          :placeholder="defaultPlaybackUserAgent"
+          density="comfortable"
+          variant="solo-filled"
+          hide-details
+        />
+        <div class="playback-agent-form__actions">
+          <VBtn variant="tonal" type="button" @click="resetPlaybackUserAgent">
+            恢复默认
+          </VBtn>
+          <VBtn color="primary" type="button" @click="savePlaybackUserAgent">
+            保存 UA
+          </VBtn>
+        </div>
+      </div>
+      <p class="settings-note">
+        该设置只影响 mpv/libmpv 播放流请求；WebView 的普通 API 请求无法可靠自定义 User-Agent。
+      </p>
+    </VCard>
+
+    <VCard class="settings-card" variant="flat">
+      <div class="settings-card__heading">
+        <div>
+          <h3>默认播放偏好</h3>
+          <p>进入播放器时自动选择匹配的音轨、字幕和转码策略。</p>
+        </div>
+      </div>
+
+      <div class="playback-preferences-form">
+        <VTextField
+          v-model.trim="playbackPreferenceDraft.preferredAudioLanguage"
+          label="默认音轨语言"
+          placeholder="例如：chi / zho / eng / jpn"
+          density="comfortable"
+          variant="solo-filled"
+          hide-details
+        />
+        <VTextField
+          v-model.trim="playbackPreferenceDraft.preferredSubtitleLanguage"
+          label="默认字幕语言"
+          placeholder="留空则默认关闭字幕"
+          density="comfortable"
+          variant="solo-filled"
+          hide-details
+        />
+        <VSwitch
+          v-model="playbackPreferenceDraft.defaultForceTranscode"
+          class="playback-preferences-form__switch"
+          color="primary"
+          label="默认强制转码"
+          hide-details
+        />
+        <VSelect
+          v-model="playbackPreferenceDraft.defaultQualityPreset"
+          label="默认播放质量"
+          :items="PLAYBACK_QUALITY_OPTIONS"
+          item-title="title"
+          item-value="value"
+          density="comfortable"
+          variant="solo-filled"
+          hide-details
+        />
+        <VTextField
+          v-if="playbackPreferenceDraft.defaultQualityPreset === 'custom'"
+          v-model.number="playbackPreferenceDraft.customMaxStreamingBitrate"
+          label="自定义最大码率（bps）"
+          type="number"
+          min="1000000"
+          max="120000000"
+          step="1000000"
+          density="comfortable"
+          variant="solo-filled"
+          hide-details
+        />
+        <div class="playback-agent-form__actions">
+          <VBtn variant="tonal" type="button" @click="resetPlaybackPreferences">
+            恢复默认
+          </VBtn>
+          <VBtn color="primary" type="button" @click="savePlaybackPreferences">
+            保存偏好
+          </VBtn>
+        </div>
+      </div>
+      <p class="settings-note">
+        语言匹配会同时检查 Emby 返回的 Language 和 DisplayTitle；例如中文可尝试 chi、zho 或 chinese。
+      </p>
+    </VCard>
+
+    <VCard class="settings-card settings-card--danger" variant="flat">
+      <div class="settings-card__heading">
+        <div>
+          <h3>本地安全存储</h3>
+          <p>已保存账号的访问令牌存放在系统 Keychain，不再写入浏览器 localStorage。</p>
+        </div>
+        <VBtn
+          color="error"
+          variant="tonal"
+          type="button"
+          :disabled="isBusy || accounts.length === 0"
+          @click="isClearAccountsDialogOpen = true"
+        >
+          <template #prepend>
+            <Trash2 :size="16" />
+          </template>
+          清除本地账号
+        </VBtn>
+      </div>
+      <p class="settings-note">
+        清除后会删除 Keychain 中的账号凭据、旧版明文账号缓存和当前登录状态；服务器端账号不会被删除。
+      </p>
+    </VCard>
+
     <VAlert v-if="errorMessage" type="error" variant="tonal">{{ errorMessage }}</VAlert>
 
     <VDialog v-model="isDialogOpen" max-width="460">
@@ -237,6 +430,30 @@ function formatServer(serverUrl: string) {
         </form>
       </VCard>
     </VDialog>
+
+    <VDialog v-model="isClearAccountsDialogOpen" max-width="440">
+      <VCard class="server-dialog">
+        <div class="server-dialog__header">
+          <h3>清除本地账号？</h3>
+          <VBtn icon variant="tonal" size="small" type="button" @click="isClearAccountsDialogOpen = false">
+            <X :size="17" />
+          </VBtn>
+        </div>
+
+        <p class="settings-note">
+          这会从本机 Keychain 删除所有已保存 Emby token，并清空当前会话。之后需要重新登录。
+        </p>
+
+        <div class="server-dialog__actions">
+          <VBtn variant="tonal" type="button" @click="isClearAccountsDialogOpen = false">
+            取消
+          </VBtn>
+          <VBtn color="error" type="button" :loading="isBusy" @click="confirmClearLocalAccounts">
+            确认清除
+          </VBtn>
+        </div>
+      </VCard>
+    </VDialog>
   </section>
 </template>
 
@@ -267,12 +484,45 @@ function formatServer(serverUrl: string) {
   box-shadow: none;
 }
 
+.settings-card--danger {
+  border-color: color-mix(in srgb, rgb(var(--v-theme-error)) 28%, rgb(255 255 255 / 7%));
+}
+
 .settings-card__heading h3 {
   margin: 0;
   color: var(--color-text);
   font-size: 1rem;
   font-weight: 650;
   line-height: 1.25;
+}
+
+.settings-card__heading p,
+.settings-note {
+  margin: 4px 0 0;
+  color: var(--color-muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.playback-agent-form {
+  display: grid;
+  gap: 10px;
+}
+
+.playback-preferences-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.playback-preferences-form__switch {
+  align-self: center;
+}
+
+.playback-agent-form__actions {
+  display: flex;
+  justify-content: end;
+  gap: 8px;
 }
 
 .account-list {
@@ -398,6 +648,10 @@ function formatServer(serverUrl: string) {
 
   .account-row__actions {
     justify-content: flex-end;
+  }
+
+  .playback-preferences-form {
+    grid-template-columns: 1fr;
   }
 }
 </style>
