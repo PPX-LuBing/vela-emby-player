@@ -8,6 +8,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run",
     "tauri:dev": "node scripts/run-tauri.mjs dev",
     "tauri:build": "node scripts/run-tauri.mjs build && node scripts/sign-macos-app.mjs"
   },
@@ -24,6 +25,7 @@
     "sass-embedded": "^1.99.0",
     "typescript": "^5.6.3",
     "vite-plugin-vuetify": "^2.1.3",
+    "vitest": "^2.1.9",
     "vue-tsc": "^2.2.12"
   }
 }
