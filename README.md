@@ -26,7 +26,7 @@ Vela Emby Player is a Tauri desktop client for Emby. It provides a native deskto
 - Rust toolchain compatible with Tauri 2
 - Platform dependencies required by Tauri
 
-The bundled `tauri:dev` and `tauri:build` scripts currently include local macOS-specific environment variables for `RUSTC`, `CARGO_HOME`, and proxy settings. Adjust those values in `package.json` if your local Rust toolchain or network setup is different.
+The bundled `tauri:dev` and `tauri:build` scripts use the Rust toolchain and network proxy settings from your shell environment. Set variables such as `RUSTC`, `CARGO_HOME`, `HTTP_PROXY`, or `HTTPS_PROXY` before running the scripts if your local machine needs custom values.
 
 ## Development
 
@@ -63,6 +63,18 @@ pnpm tauri:build
 ```
 
 The macOS build script runs `scripts/sign-macos-app.mjs` after the Tauri build.
+
+If crates.io access requires a proxy, export it in your shell before building:
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:10808
+export HTTPS_PROXY=http://127.0.0.1:10808
+pnpm tauri:build
+```
+
+## QA
+
+Use [QA.md](QA.md) for the manual regression checklist against a real Emby server and the packaged macOS app.
 
 ## Project Structure
 
