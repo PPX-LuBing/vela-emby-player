@@ -2,10 +2,14 @@
 import { computed, reactive, shallowRef, watch } from 'vue'
 import { Check, Edit3, LogOut, Plus, Trash2, X } from 'lucide-vue-next'
 import {
-  PLAYBACK_QUALITY_OPTIONS,
   type EmbySession,
   type PlaybackPreferences,
 } from '../composables/useEmbyClient'
+import {
+  PLAYBACK_QUALITY_OPTIONS,
+  bitrateToMbps,
+  mbpsToBitrate,
+} from '../composables/playbackPreferences'
 
 type DialogMode = 'add' | 'edit'
 
@@ -49,6 +53,7 @@ const playbackPreferenceDraft = reactive<PlaybackPreferences>({
   defaultQualityPreset: props.playbackPreferences.defaultQualityPreset,
   customMaxStreamingBitrate: props.playbackPreferences.customMaxStreamingBitrate,
 })
+const customMaxStreamingMbpsDraft = shallowRef(bitrateToMbps(props.playbackPreferences.customMaxStreamingBitrate))
 
 const dialogTitle = computed(() =>
   dialogMode.value === 'add' ? '添加 Emby 服务' : '编辑服务器',
@@ -82,6 +87,7 @@ watch(
     playbackPreferenceDraft.defaultForceTranscode = nextPreferences.defaultForceTranscode
     playbackPreferenceDraft.defaultQualityPreset = nextPreferences.defaultQualityPreset
     playbackPreferenceDraft.customMaxStreamingBitrate = nextPreferences.customMaxStreamingBitrate
+    customMaxStreamingMbpsDraft.value = bitrateToMbps(nextPreferences.customMaxStreamingBitrate)
   },
 )
 
@@ -146,7 +152,7 @@ function savePlaybackPreferences() {
     preferredSubtitleLanguage: playbackPreferenceDraft.preferredSubtitleLanguage,
     defaultForceTranscode: playbackPreferenceDraft.defaultForceTranscode,
     defaultQualityPreset: playbackPreferenceDraft.defaultQualityPreset,
-    customMaxStreamingBitrate: playbackPreferenceDraft.customMaxStreamingBitrate,
+    customMaxStreamingBitrate: mbpsToBitrate(customMaxStreamingMbpsDraft.value),
   })
 }
 
@@ -156,6 +162,7 @@ function resetPlaybackPreferences() {
   playbackPreferenceDraft.defaultForceTranscode = false
   playbackPreferenceDraft.defaultQualityPreset = 'original'
   playbackPreferenceDraft.customMaxStreamingBitrate = 12_000_000
+  customMaxStreamingMbpsDraft.value = 12
   savePlaybackPreferences()
 }
 
@@ -325,12 +332,12 @@ function confirmClearLocalAccounts() {
         />
         <VTextField
           v-if="playbackPreferenceDraft.defaultQualityPreset === 'custom'"
-          v-model.number="playbackPreferenceDraft.customMaxStreamingBitrate"
-          label="自定义最大码率（bps）"
+          v-model.number="customMaxStreamingMbpsDraft"
+          label="自定义最大码率（Mbps）"
           type="number"
-          min="1000000"
-          max="120000000"
-          step="1000000"
+          min="1"
+          max="120"
+          step="1"
           density="comfortable"
           variant="solo-filled"
           hide-details

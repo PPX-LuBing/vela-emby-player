@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { Bug, Copy, ExternalLink, RefreshCw } from 'lucide-vue-next'
 import {
-  PLAYBACK_QUALITY_OPTIONS,
   type EmbyMediaSource,
   type EmbyMediaStream,
   type EmbyPlaybackInfo,
   type PlaybackQualityPreset,
 } from '../composables/useEmbyClient'
+import {
+  PLAYBACK_QUALITY_OPTIONS,
+  bitrateToMbps,
+  mbpsToBitrate,
+} from '../composables/playbackPreferences'
 import type { PlayerDiagnostics, PlayerEngineStatus } from '../composables/usePlayerEngine'
 
 type SubtitleOption = EmbyMediaStream | { Index: null; DisplayTitle: string }
@@ -100,14 +104,14 @@ const emit = defineEmits<{
 
       <VTextField
         v-if="qualityPreset === 'custom'"
-        :model-value="customMaxStreamingBitrate"
-        label="最大码率 bps"
+        :model-value="bitrateToMbps(customMaxStreamingBitrate)"
+        label="最大码率 Mbps"
         type="number"
-        min="1000000"
-        max="120000000"
-        step="1000000"
+        min="1"
+        max="120"
+        step="1"
         hide-details
-        @update:model-value="emit('updateCustomMaxStreamingBitrate', Number($event))"
+        @update:model-value="emit('updateCustomMaxStreamingBitrate', mbpsToBitrate($event))"
       />
     </div>
 

@@ -7,7 +7,6 @@ import {
   MonitorPlay,
   Play,
 } from 'lucide-vue-next'
-import { PLAYBACK_QUALITY_OPTIONS } from '../composables/useEmbyClient'
 import type {
   EmbyItem,
   EmbyMediaSource,
@@ -29,6 +28,11 @@ import {
 } from '../composables/usePlayerEngine'
 import { usePlaybackReporting } from '../composables/usePlaybackReporting'
 import { useSoftwareRenderer } from '../composables/useSoftwareRenderer'
+import {
+  bitrateForQualityPreset,
+  getPreferredStream,
+  normalizeBitrate,
+} from '../composables/playbackPreferences'
 
 const MPV_PATH_KEY = 'vela_player_mpv_path'
 
@@ -157,11 +161,7 @@ const directPlayUrl = computed(() => {
 })
 
 const selectedMaxStreamingBitrate = computed(() => {
-  if (qualityPreset.value === 'custom') {
-    return normalizeBitrate(customMaxStreamingBitrate.value)
-  }
-
-  return PLAYBACK_QUALITY_OPTIONS.find((option) => option.value === qualityPreset.value)?.bitrate ?? null
+  return bitrateForQualityPreset(qualityPreset.value, customMaxStreamingBitrate.value)
 })
 
 const subtitleUrl = computed(() => {
@@ -340,6 +340,9 @@ async function playInMpv(startPositionSecondsOverride?: number) {
   const item = props.item
   const source = selectedSource.value
   if (!item || !source || !directPlayUrl.value) {
+    if (item && !source) {
+      errorMessage.value = '当前媒体没有可用媒体源。请刷新媒体详情，或在 Emby 服务器检查该媒体文件。'
+    }
     return
   }
 
@@ -388,7 +391,7 @@ async function playInMpv(startPositionSecondsOverride?: number) {
     showOsd(startPositionSeconds > 0 ? `从 ${formatTime(startPositionSeconds)} 继续播放` : '播放')
   } catch (error) {
     softwareRenderer.resetSoftwareRendering()
-    errorMessage.value = normalizePlayerEngineError(error)
+    errorMessage.value = normalizePlaybackStartError(error, forceTranscode.value)
   } finally {
     isStartingPlayback.value = false
   }
@@ -807,42 +810,21 @@ function getDefaultStream(source: EmbyMediaSource | undefined, type: EmbyMediaSt
   return streams.find((stream) => stream.IsDefault) ?? streams[0]
 }
 
-function getPreferredStream(
-  source: EmbyMediaSource | undefined,
-  type: EmbyMediaStream['Type'],
-  preferredLanguage: string,
-) {
-  const streams = source?.MediaStreams?.filter((stream) => stream.Type === type) ?? []
-  const normalizedPreference = preferredLanguage.trim().toLowerCase()
-
-  if (normalizedPreference) {
-    const matched = streams.find((stream) => streamMatchesLanguage(stream, normalizedPreference))
-    if (matched) {
-      return matched
-    }
+function normalizePlaybackStartError(error: unknown, isForcedTranscode: boolean) {
+  const message = normalizePlayerEngineError(error)
+  if (message.includes('无法加载 libmpv') || message.includes('mpv_create') || message.includes('libmpv')) {
+    return `${message}。请确认 bundled libmpv 存在，或在 Debug 中复制直链用外部 mpv 排查。`
   }
 
-  if (type === 'Subtitle' && !normalizedPreference) {
-    return null
+  if (message.includes('无法启动 mpv') || message.includes('No such file') || message.includes('ENOENT')) {
+    return `${message}。请确认 mpv 已安装，或在播放器设置中配置正确的 mpv 路径。`
   }
 
-  return streams.find((stream) => stream.IsDefault) ?? streams[0] ?? null
-}
-
-function streamMatchesLanguage(stream: EmbyMediaStream, preferredLanguage: string) {
-  const candidates = [stream.Language, stream.DisplayTitle, stream.Codec]
-    .filter(Boolean)
-    .map((value) => value?.toLowerCase())
-
-  return candidates.some((candidate) => candidate?.includes(preferredLanguage))
-}
-
-function normalizeBitrate(value: number) {
-  if (!Number.isFinite(value) || value <= 0) {
-    return 12_000_000
+  if (!isForcedTranscode) {
+    return `${message}。如果该媒体无法直放，请开启“强制转码”或选择较低播放质量后重试。`
   }
 
-  return Math.round(Math.min(120_000_000, Math.max(1_000_000, value)))
+  return message
 }
 
 function formatSource(source: EmbyMediaSource) {

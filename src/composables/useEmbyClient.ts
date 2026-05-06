@@ -1,5 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { computed, readonly, shallowRef } from 'vue'
+import {
+  PLAYBACK_QUALITY_OPTIONS,
+  normalizeBitrate,
+} from './playbackPreferences'
 
 const CLIENT_NAME = 'Vela Player'
 const DEVICE_NAME = 'Browser'
@@ -10,14 +14,7 @@ const ACCOUNTS_KEY = 'vela_player_accounts'
 const ACTIVE_ACCOUNT_KEY = 'vela_player_active_account'
 const PLAYBACK_USER_AGENT_KEY = 'vela_player_playback_user_agent'
 const PLAYBACK_PREFERENCES_KEY = 'vela_player_playback_preferences'
-export const PLAYBACK_QUALITY_OPTIONS: readonly { title: string; value: PlaybackQualityPreset; bitrate: number | null }[] = [
-  { title: '原画', value: 'original', bitrate: null },
-  { title: '4K · 80 Mbps', value: '4k', bitrate: 80_000_000 },
-  { title: '1080p · 20 Mbps', value: '1080p', bitrate: 20_000_000 },
-  { title: '720p · 8 Mbps', value: '720p', bitrate: 8_000_000 },
-  { title: '480p · 3 Mbps', value: '480p', bitrate: 3_000_000 },
-  { title: '自定义码率', value: 'custom', bitrate: null },
-]
+export { PLAYBACK_QUALITY_OPTIONS }
 const LIBRARY_PAGE_SIZE = 80
 const SEARCH_PAGE_SIZE = 48
 
@@ -342,7 +339,11 @@ export function useEmbyClient() {
 
   async function persistAccounts() {
     const value = JSON.stringify(accounts.value)
-    await invoke('write_secure_accounts', { value })
+    try {
+      await invoke('write_secure_accounts', { value })
+    } catch (error) {
+      throw new Error(normalizeSecureStorageError(error, '写入'))
+    }
     localStorage.removeItem(ACCOUNTS_KEY)
     localStorage.removeItem(SESSION_KEY)
   }
@@ -365,7 +366,11 @@ export function useEmbyClient() {
       clearCurrentData()
       clearLegacyAccountStorage()
       localStorage.removeItem(ACTIVE_ACCOUNT_KEY)
-      await invoke('delete_secure_accounts')
+      try {
+        await invoke('delete_secure_accounts')
+      } catch (error) {
+        throw new Error(normalizeSecureStorageError(error, '删除'))
+      }
     } catch (error) {
       errorMessage.value = error instanceof Error ? error.message : '清除本地账号失败'
       throw error
@@ -387,7 +392,12 @@ export function useEmbyClient() {
   }
 
   async function restoreAccountsFromSecureStorage() {
-    const securePayload = await invoke<SecureStoragePayload>('read_secure_accounts')
+    let securePayload: SecureStoragePayload
+    try {
+      securePayload = await invoke<SecureStoragePayload>('read_secure_accounts')
+    } catch (error) {
+      throw new Error(normalizeSecureStorageError(error, '读取'))
+    }
     const secureAccounts = parseAccounts(securePayload.value ?? '')
     const legacyAccounts = loadLegacyAccounts()
     const mergedAccounts = mergeAccounts(secureAccounts, legacyAccounts)
@@ -928,7 +938,9 @@ export function useEmbyClient() {
 
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const active = requireSession()
-    const response = await fetch(`${active.serverUrl}${path}`, {
+    let response: Response
+    try {
+      response = await fetch(`${active.serverUrl}${path}`, {
       ...init,
       headers: {
         'Content-Type': 'application/json',
@@ -936,10 +948,13 @@ export function useEmbyClient() {
         'X-Emby-Authorization': buildAuthorizationHeader(active.accessToken),
         ...init.headers,
       },
-    })
+      })
+    } catch (error) {
+      throw new Error(normalizeNetworkError(error))
+    }
 
     if (!response.ok) {
-      throw new Error(`Emby 请求失败：HTTP ${response.status}`)
+      throw new Error(normalizeEmbyHttpError(response.status))
     }
 
     if (response.status === 204) {
@@ -1033,6 +1048,32 @@ function requireSession() {
   return session.value
 }
 
+function normalizeNetworkError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return `无法连接 Emby 服务器。请检查服务器地址、网络连接或反向代理配置。原始错误：${message}`
+}
+
+function normalizeEmbyHttpError(status: number) {
+  if (status === 401 || status === 403) {
+    return 'Emby 登录已失效或权限不足。请在设置中切换账号，或清除本地账号后重新登录。'
+  }
+
+  if (status === 404) {
+    return 'Emby 没有找到请求的媒体或接口。请刷新媒体库后重试。'
+  }
+
+  if (status >= 500) {
+    return `Emby 服务器返回错误 HTTP ${status}。请稍后重试，或检查服务器日志。`
+  }
+
+  return `Emby 请求失败：HTTP ${status}`
+}
+
+function normalizeSecureStorageError(error: unknown, action: '读取' | '写入' | '删除') {
+  const message = error instanceof Error ? error.message : String(error)
+  return `系统安全存储${action}失败。请确认 macOS Keychain 可用，必要时在设置中清除本地账号后重新登录。原始错误：${message}`
+}
+
 function normalizeServerUrl(serverUrl: string) {
   const trimmed = serverUrl.trim().replace(/\/+$/, '')
   if (/^https?:\/\//i.test(trimmed)) {
@@ -1074,21 +1115,12 @@ function normalizePlaybackPreferences(preferences: Partial<PlaybackPreferences>)
     preferredSubtitleLanguage: preferences.preferredSubtitleLanguage?.trim().toLowerCase() ?? '',
     defaultForceTranscode: preferences.defaultForceTranscode === true,
     defaultQualityPreset: qualityPreset,
-    customMaxStreamingBitrate: normalizeCustomBitrate(preferences.customMaxStreamingBitrate),
+    customMaxStreamingBitrate: normalizeBitrate(preferences.customMaxStreamingBitrate),
   }
 }
 
 function isPlaybackQualityPreset(value: unknown): value is PlaybackQualityPreset {
   return PLAYBACK_QUALITY_OPTIONS.some((option) => option.value === value)
-}
-
-function normalizeCustomBitrate(value: unknown) {
-  const numeric = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return 12_000_000
-  }
-
-  return Math.round(Math.min(120_000_000, Math.max(1_000_000, numeric)))
 }
 
 function itemFields() {
