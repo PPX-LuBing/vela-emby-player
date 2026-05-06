@@ -8,6 +8,9 @@ use std::sync::Mutex;
 use tauri::window::WindowBuilder;
 use tauri::{Manager, Window, WindowEvent};
 
+const SECURE_STORAGE_SERVICE: &str = "app.vela.emby-player";
+const SECURE_STORAGE_ACCOUNTS_KEY: &str = "accounts";
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MpvPlayRequest {
@@ -16,6 +19,8 @@ struct MpvPlayRequest {
     mpv_path: Option<String>,
     headers: Vec<HttpHeader>,
     start_position_seconds: Option<f64>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     subtitle_url: Option<String>,
     embed_bounds: Option<EmbeddedPlayerBounds>,
     render_mode: Option<PlayerRenderMode>,
@@ -98,6 +103,12 @@ struct PlayerEngineStatus {
     libmpv_available: bool,
     libmpv_path: Option<String>,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecureStoragePayload {
+    value: Option<String>,
 }
 
 #[derive(Default)]
@@ -323,6 +334,35 @@ fn player_engine_status(app: tauri::AppHandle) -> PlayerEngineStatus {
     }
 }
 
+#[tauri::command]
+fn read_secure_accounts() -> Result<SecureStoragePayload, String> {
+    match keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY).get_password() {
+        Ok(value) => Ok(SecureStoragePayload { value: Some(value) }),
+        Err(keyring::Error::NoEntry) => Ok(SecureStoragePayload { value: None }),
+        Err(error) => Err(format!("读取系统安全存储失败：{error}")),
+    }
+}
+
+#[tauri::command]
+fn write_secure_accounts(value: String) -> Result<(), String> {
+    keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY)
+        .set_password(&value)
+        .map_err(|error| format!("写入系统安全存储失败：{error}"))
+}
+
+#[tauri::command]
+fn delete_secure_accounts() -> Result<(), String> {
+    match keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY).delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("删除系统安全存储失败：{error}")),
+    }
+}
+
+fn keyring_entry(key: &str) -> keyring::Entry {
+    keyring::Entry::new(SECURE_STORAGE_SERVICE, key)
+        .expect("static keyring service/account values should be valid")
+}
+
 fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Result<MpvPlayResponse, String> {
     let mpv_path = resolve_mpv_path(&app, request.mpv_path.as_deref())?;
 
@@ -341,10 +381,24 @@ fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Resu
         command.arg(format!("--start={seconds}"));
     }
 
+    if let Some(audio_stream_index) = request.audio_stream_index {
+        command.arg(format!("--aid={audio_stream_index}"));
+    }
+
+    if let Some(subtitle_stream_index) = request.subtitle_stream_index {
+        command.arg(format!("--sid={subtitle_stream_index}"));
+    } else {
+        command.arg("--sid=no");
+    }
+
+    if let Some(user_agent) = user_agent_from_headers(&request.headers) {
+        command.arg(format!("--user-agent={user_agent}"));
+    }
+
     for header in request.headers {
         let name = header.name.trim();
         let value = header.value.trim();
-        if !name.is_empty() && !value.is_empty() {
+        if !name.eq_ignore_ascii_case("User-Agent") && !name.is_empty() && !value.is_empty() {
             command.arg(format!("--http-header-fields={name}: {value}"));
         }
     }
@@ -370,6 +424,14 @@ fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Resu
     })
 }
 
+fn user_agent_from_headers(headers: &[HttpHeader]) -> Option<String> {
+    headers.iter().find_map(|header| {
+        let name = header.name.trim();
+        let value = header.value.trim();
+        (name.eq_ignore_ascii_case("User-Agent") && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -383,7 +445,10 @@ pub fn run() {
             seek_player,
             set_player_volume,
             control_player,
-            player_engine_status
+            player_engine_status,
+            read_secure_accounts,
+            write_secure_accounts,
+            delete_secure_accounts
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -683,13 +748,28 @@ impl LibMpvPlayer {
             self.set_option("start", &seconds.to_string())?;
         }
 
+        if let Some(audio_stream_index) = request.audio_stream_index {
+            self.set_option("aid", &audio_stream_index.to_string())?;
+        }
+
+        if let Some(subtitle_stream_index) = request.subtitle_stream_index {
+            self.set_option("sid", &subtitle_stream_index.to_string())?;
+        } else {
+            self.set_option("sid", "no")?;
+        }
+
+        if let Some(user_agent) = user_agent_from_headers(&request.headers) {
+            self.set_option("user-agent", &user_agent)?;
+        }
+
         let headers = request
             .headers
             .iter()
             .filter_map(|header| {
                 let name = header.name.trim();
                 let value = header.value.trim();
-                (!name.is_empty() && !value.is_empty()).then(|| format!("{name}: {value}"))
+                (!name.eq_ignore_ascii_case("User-Agent") && !name.is_empty() && !value.is_empty())
+                    .then(|| format!("{name}: {value}"))
             })
             .collect::<Vec<_>>()
             .join(",");
