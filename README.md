@@ -5,7 +5,16 @@ Vela Emby Player is a Tauri desktop client for Emby. It provides a native deskto
 ## Features
 
 - Connect to an Emby server with saved account profiles.
-- Browse libraries, media details, seasons, and episodes.
+- Browse libraries, media details, seasons, episodes, artists, albums, tracks, collections, and playlists.
+- Browse discovered people, genres, and tags and open matching media results.
+- View directors, writers, cast, and studios on media detail pages.
+- View premiere date, official rating, media source, video, audio, and subtitle metadata on detail pages.
+- Discover similar recommendations from media detail pages.
+- Navigate playback chapters and skip detected intro/outro chapters from the player.
+- Filter loaded library items by playback state, type, year, genre, and sort order.
+- Browse and play Live TV channels when the Emby server provides them.
+- Continue in-progress media, jump to next-up episodes, and manage playback history with type filters and progress clearing.
+- Keep playback queue and playback mode locally, scoped per saved account.
 - Play media through the bundled mpv integration.
 - Report playback start, progress, and stop events back to Emby.
 - Configure and switch saved Emby accounts from the settings view.

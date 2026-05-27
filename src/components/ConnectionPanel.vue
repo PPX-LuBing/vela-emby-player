@@ -33,18 +33,18 @@ function submitLogin() {
 </script>
 
 <template>
-  <section class="connection-panel">
-    <div class="connection-panel__heading">
-      <span class="connection-panel__icon"><Server :size="18" /></span>
+  <section class="grid gap-4">
+    <div class="flex items-center gap-3">
+      <span class="grid h-[38px] w-[38px] place-items-center bg-[rgb(var(--v-theme-primary))] text-[rgb(var(--v-theme-on-primary))]"><Server :size="18" /></span>
       <div>
-        <p class="connection-panel__eyebrow">Emby Server</p>
-        <h2 class="connection-panel__title">
+        <p class="m-0 text-[0.78rem] text-[rgba(var(--v-theme-on-surface),0.68)]">Emby Server</p>
+        <h2 class="m-0 mt-[3px] text-[1.05rem] font-500 leading-[1.25] tracking-0">
           {{ session ? session.username : '连接媒体服务器' }}
         </h2>
       </div>
     </div>
 
-    <form v-if="!session" class="connection-panel__form" @submit.prevent="submitLogin">
+    <form v-if="!session" class="grid gap-4" @submit.prevent="submitLogin">
       <VTextField
         v-model.trim="form.serverUrl"
         label="服务器地址"
@@ -75,8 +75,8 @@ function submitLogin() {
       </VBtn>
     </form>
 
-    <div v-else class="connection-panel__session">
-      <p class="connection-panel__server">{{ session.serverUrl }}</p>
+    <div v-else class="flex items-center justify-between gap-3">
+      <p class="m-0 text-[0.78rem] text-[rgba(var(--v-theme-on-surface),0.68)]">{{ session.serverUrl }}</p>
       <VBtn variant="tonal" type="button" @click="emit('logout')">
         <template #prepend>
           <LogOut :size="17" />
@@ -86,57 +86,3 @@ function submitLogin() {
     </div>
   </section>
 </template>
-
-<style scoped>
-.connection-panel {
-  display: grid;
-  gap: 16px;
-  animation: surface-enter var(--motion-emphasized) both;
-}
-
-.connection-panel__heading {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.connection-panel__icon {
-  display: grid;
-  width: 38px;
-  height: 38px;
-  place-items: center;
-  color: #ffffff;
-  background: var(--color-primary-container);
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 8px;
-}
-
-.connection-panel__eyebrow,
-.connection-panel__server {
-  margin: 0;
-  color: var(--color-muted);
-  font-size: 0.78rem;
-}
-
-.connection-panel__title {
-  margin: 3px 0 0;
-  color: var(--color-text);
-  font-size: 1.05rem;
-  font-weight: 650;
-  line-height: 1.25;
-  letter-spacing: 0;
-}
-
-.connection-panel__form {
-  display: grid;
-  gap: 16px;
-}
-
-.connection-panel__session {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-</style>

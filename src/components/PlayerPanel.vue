@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, shallowRef, useTemplateRef, watch } from 'vue'
+import { useEventListener } from '@vueuse/core'
 import {
   ArrowLeft,
+  BookOpen,
   Loader2,
+  ListMusic,
   MoreHorizontal,
   MonitorPlay,
   Play,
+  SkipForward,
 } from 'lucide-vue-next'
 import type {
   EmbyItem,
@@ -16,8 +20,11 @@ import type {
   PlaybackPreferences,
   PlaybackQualityPreset,
 } from '../composables/useEmbyClient'
+import { formatPlaybackMode, type PlaybackMode } from '../composables/usePlaybackQueue'
 import { useEpisodeQueue } from '../composables/useEpisodeQueue'
+import PlayerChapterPanel from './PlayerChapterPanel.vue'
 import PlayerControls from './PlayerControls.vue'
+import PlayerQueuePanel from './PlayerQueuePanel.vue'
 import PlayerSettingsPanel from './PlayerSettingsPanel.vue'
 import {
   normalizePlayerEngineError,
@@ -33,6 +40,12 @@ import {
   getPreferredStream,
   normalizeBitrate,
 } from '../composables/playbackPreferences'
+import {
+  createPlaybackChapters,
+  getActiveSkippableChapter,
+  type PlaybackChapter,
+} from '../composables/playbackChapters'
+import { formatAudioTrackNumber, getResumePositionSeconds, getResumePositionTicks, secondsToTicks } from '../composables/mediaItemDisplay'
 
 const MPV_PATH_KEY = 'vela_player_mpv_path'
 
@@ -50,6 +63,7 @@ const props = defineProps<{
       audioStreamIndex?: number
       subtitleStreamIndex?: number
       forceTranscode?: boolean
+      itemType?: string
       maxStreamingBitrate?: number | null
     },
   ) => string
@@ -80,11 +94,19 @@ const props = defineProps<{
     playSessionId: string | undefined,
     positionTicks: number,
   ) => Promise<void>
+  queueItems: readonly EmbyItem[]
+  activeQueueItemId: string
+  playbackMode: PlaybackMode
+  nextQueueItem: Readonly<EmbyItem | null>
+  previousQueueItem: Readonly<EmbyItem | null>
 }>()
 
 const emit = defineEmits<{
   back: []
   changeItem: [item: EmbyItem]
+  cyclePlaybackMode: []
+  clearQueue: []
+  removeQueueItem: [itemId: string]
 }>()
 
 const playerEngine = usePlayerEngine()
@@ -110,9 +132,12 @@ const diagnostics = shallowRef<PlayerDiagnostics | null>(null)
 const copied = shallowRef(false)
 const showPlayerSettings = shallowRef(false)
 const showDebugPanel = shallowRef(false)
+const showQueuePanel = shallowRef(false)
+const showChapterPanel = shallowRef(false)
 const volumeLevel = shallowRef(100)
 const controlsVisible = shallowRef(true)
 const isStartingPlayback = shallowRef(false)
+const isPreparingFirstFrame = shallowRef(false)
 const playerOsdMessage = shallowRef('')
 const playerStageRef = useTemplateRef<HTMLElement>('playerStage')
 const renderCanvasRef = useTemplateRef<HTMLCanvasElement>('renderCanvas')
@@ -121,7 +146,10 @@ let hideControlsTimer = 0
 let osdTimer = 0
 let didStopForExit = false
 let didAutoAdvance = false
-let autoplayAfterItemChange = false
+let lastPlaybackPositionSeconds = 0
+let playbackStartRequestId = 0
+
+useEventListener(window, 'keydown', handlePlayerKeydown)
 
 const selectedSource = computed(() => {
   const sources = playbackInfo.value?.MediaSources ?? []
@@ -133,6 +161,10 @@ const softwareRenderer = useSoftwareRenderer({
   renderFrame: playerEngine.renderFrame,
   onError: (error) => {
     errorMessage.value = normalizePlayerEngineError(error)
+    isPreparingFirstFrame.value = false
+  },
+  onVisibleFrame: () => {
+    isPreparingFirstFrame.value = false
   },
 })
 const isSoftwareRendering = softwareRenderer.isSoftwareRendering
@@ -156,6 +188,7 @@ const directPlayUrl = computed(() => {
     audioStreamIndex: selectedAudioIndex.value ?? undefined,
     subtitleStreamIndex: selectedSubtitleIndex.value ?? undefined,
     forceTranscode: forceTranscode.value,
+    itemType: props.item.Type,
     maxStreamingBitrate: selectedMaxStreamingBitrate.value,
   })
 })
@@ -185,6 +218,31 @@ const displayTitle = computed(() => {
     return '选择一个媒体条目'
   }
 
+  if (props.item.Type === 'Audio') {
+    const parts = [
+      props.item.Album || props.item.AlbumArtists?.[0] || props.item.Artists?.[0],
+      formatAudioTrackNumber(props.item),
+      props.item.Name,
+    ].filter(Boolean)
+    return parts.join(' · ')
+  }
+
+  if (props.item.Type === 'MusicAlbum') {
+    return [props.item.AlbumArtist || props.item.AlbumArtists?.[0] || props.item.Artists?.[0], props.item.Name]
+      .filter(Boolean)
+      .join(' · ') || props.item.Name
+  }
+
+  if (props.item.Type === 'MusicArtist') {
+    return props.item.Name
+  }
+
+  if (props.item.Type === 'TvChannel' || props.item.Type === 'Channel') {
+    return [props.item.ChannelNumber || props.item.Number, props.item.Name, props.item.CurrentProgram?.Name]
+      .filter(Boolean)
+      .join(' · ')
+  }
+
   if (props.item.Type === 'Episode' && props.item.SeriesName) {
     const season = props.item.ParentIndexNumber
       ? `S${String(props.item.ParentIndexNumber).padStart(2, '0')}`
@@ -210,7 +268,8 @@ const shouldShowControls = computed(
     !hasActivePlayback.value ||
     isPaused.value ||
     showPlayerSettings.value ||
-    showDebugPanel.value,
+    showDebugPanel.value ||
+    showQueuePanel.value,
 )
 const startupMessage = computed(() => {
   if (isLoading.value) {
@@ -227,12 +286,42 @@ const startupMessage = computed(() => {
 
   return ''
 })
+const playbackLoadingMessage = computed(() => {
+  if (isStartingPlayback.value) {
+    return '正在启动播放器'
+  }
+
+  if (isPreparingFirstFrame.value || (isSoftwareRendering.value && !hasRenderedFrame.value)) {
+    return '正在缓冲首帧'
+  }
+
+  return ''
+})
 const playbackProgress = computed(() => {
   if (!playbackDuration.value) {
     return 0
   }
 
   return Math.min(100, Math.max(0, (playbackPosition.value / playbackDuration.value) * 100))
+})
+const playbackChapters = computed(() => createPlaybackChapters(props.item?.Chapters, playbackDuration.value))
+const activeSkippableChapter = computed(() => getActiveSkippableChapter(playbackChapters.value, playbackPosition.value))
+
+const isLiveTvPlayback = computed(() => props.item?.Type === 'TvChannel' || props.item?.Type === 'Channel')
+const canRetryPlayback = computed(() => Boolean(
+  errorMessage.value &&
+  props.item &&
+  !isLoading.value &&
+  !isStartingPlayback.value,
+))
+const canRetryWithTranscode = computed(() => canRetryPlayback.value && !forceTranscode.value && !isLiveTvPlayback.value)
+
+const queueLabel = computed(() => {
+  if (props.item?.Type === 'MusicArtist' || props.item?.Type === 'MusicAlbum' || props.item?.Type === 'Audio') {
+    return '选择曲目'
+  }
+
+  return '选择分集'
 })
 
 const {
@@ -249,9 +338,18 @@ const {
   },
 })
 
+const displayPreviousItem = computed(() => props.previousQueueItem ?? previousEpisode.value)
+const displayNextItem = computed(() => props.nextQueueItem ?? nextEpisode.value)
+
 watch(
   () => props.item?.Id,
-  async (itemId) => {
+  async (itemId, _previousItemId, onCleanup) => {
+    let isStaleRequest = false
+    onCleanup(() => {
+      isStaleRequest = true
+    })
+
+    playbackStartRequestId += 1
     playbackInfo.value = null
     selectedSourceId.value = ''
     selectedAudioIndex.value = null
@@ -261,31 +359,46 @@ watch(
     customMaxStreamingBitrate.value = props.playbackPreferences.customMaxStreamingBitrate
     errorMessage.value = ''
     statusMessage.value = ''
+    isStartingPlayback.value = false
+    isPreparingFirstFrame.value = false
     playbackReporting.resetProgressReporting()
     didAutoAdvance = false
+    lastPlaybackPositionSeconds = 0
 
     if (!itemId) {
       return
     }
 
+    const requestItem = props.item
+
     isLoading.value = true
     try {
-      playbackInfo.value = await props.getPlaybackInfo(itemId, getResumePositionTicks())
-      const firstSource = playbackInfo.value.MediaSources[0]
-      selectedSourceId.value = firstSource?.Id ?? ''
-      selectedAudioIndex.value = getPreferredStream(firstSource, 'Audio', props.playbackPreferences.preferredAudioLanguage)?.Index ?? null
-      selectedSubtitleIndex.value = getPreferredStream(firstSource, 'Subtitle', props.playbackPreferences.preferredSubtitleLanguage)?.Index ?? null
-      forceTranscode.value = props.playbackPreferences.defaultForceTranscode
-      if (autoplayAfterItemChange) {
-        autoplayAfterItemChange = false
-        await nextTick()
-        await playInMpv()
+      const nextPlaybackInfo = await props.getPlaybackInfo(itemId, getResumePositionTicks(requestItem))
+      if (isStaleRequest || props.item?.Id !== itemId) {
+        return
       }
+
+      playbackInfo.value = nextPlaybackInfo
+      const firstSource = nextPlaybackInfo.MediaSources[0]
+      applyDefaultPlaybackStreams(firstSource)
+      forceTranscode.value = props.playbackPreferences.defaultForceTranscode
+      await nextTick()
+      if (isStaleRequest || props.item?.Id !== itemId) {
+        return
+      }
+
+      await playInMpv()
     } catch (error) {
+      if (isStaleRequest || props.item?.Id !== itemId) {
+        return
+      }
+
       errorMessage.value =
         error instanceof Error ? error.message : '无法获取 Emby 播放信息'
     } finally {
-      isLoading.value = false
+      if (!isStaleRequest && props.item?.Id === itemId) {
+        isLoading.value = false
+      }
     }
   },
   { immediate: true },
@@ -297,7 +410,6 @@ watch(mpvPath, (nextPath) => {
 
 onMounted(() => {
   void refreshEngineStatus()
-  window.addEventListener('keydown', handlePlayerKeydown)
   revealControls()
 })
 
@@ -305,18 +417,21 @@ watch(diagnostics, (nextDiagnostics) => {
   if (typeof nextDiagnostics?.volume === 'number') {
     volumeLevel.value = nextDiagnostics.volume
   }
+  if (typeof nextDiagnostics?.position === 'number') {
+    lastPlaybackPositionSeconds = nextDiagnostics.position
+  }
   void maybeAutoPlayNextEpisode(nextDiagnostics)
 })
 
 watch(
-  [hasActivePlayback, isPaused, showPlayerSettings, showDebugPanel],
+  [hasActivePlayback, isPaused, showPlayerSettings, showDebugPanel, showQueuePanel, showChapterPanel],
   () => {
     revealControls()
   },
 )
 
 onUnmounted(() => {
-  window.removeEventListener('keydown', handlePlayerKeydown)
+  playbackStartRequestId += 1
   void stopPlaybackForExit()
   softwareRenderer.stopRenderLoop()
   stopDiagnosticsLoop()
@@ -336,42 +451,68 @@ async function refreshEngineStatus() {
   }
 }
 
-async function playInMpv(startPositionSecondsOverride?: number) {
+async function playInMpv(startPositionSecondsOverride?: unknown) {
   const item = props.item
   const source = selectedSource.value
-  if (!item || !source || !directPlayUrl.value) {
+  const playbackUrl = directPlayUrl.value
+  if (!item || !source || !playbackUrl) {
     if (item && !source) {
       errorMessage.value = '当前媒体没有可用媒体源。请刷新媒体详情，或在 Emby 服务器检查该媒体文件。'
     }
     return
   }
 
+  const requestId = ++playbackStartRequestId
+  const itemId = item.Id
+  const sourceId = source.Id
   errorMessage.value = ''
   statusMessage.value = ''
   softwareRenderer.resetSoftwareRendering()
   playbackReporting.resetProgressReporting()
   didStopForExit = false
+  lastPlaybackPositionSeconds = 0
+  isPreparingFirstFrame.value = true
   isStartingPlayback.value = true
   revealControls()
+  let didReportStart = false
+  let startPositionSeconds = 0
+  let playSessionId: string | undefined
 
   try {
     await nextTick()
+    if (isPlaybackStartStale(requestId, itemId, sourceId)) {
+      return
+    }
+
     const auth = props.getMpvAuthContext()
     const embedBounds = getPlayerBounds()
-    const startPositionSeconds = startPositionSecondsOverride ?? getResumePositionSeconds()
+    const playbackTitle = displayTitle.value
+    const playbackSubtitleUrl = subtitleUrl.value || null
+    const audioStreamIndex = selectedAudioIndex.value
+    const subtitleStreamIndex = selectedSubtitleIndex.value
+    playSessionId = playbackInfo.value?.PlaySessionId
+    startPositionSeconds = typeof startPositionSecondsOverride === 'number'
+      ? startPositionSecondsOverride
+      : getResumePositionSeconds(item)
     await playbackReporting.reportStart(
-      item.Id,
-      source.Id,
-      playbackInfo.value?.PlaySessionId,
+      itemId,
+      sourceId,
+      playSessionId,
       secondsToTicks(startPositionSeconds),
     )
+    didReportStart = true
+    if (isPlaybackStartStale(requestId, itemId, sourceId)) {
+      await reportStoppedFor(itemId, sourceId, playSessionId, startPositionSeconds)
+      return
+    }
+
     const response = await playerEngine.playMedia({
-      url: directPlayUrl.value,
-      title: displayTitle.value,
+      url: playbackUrl,
+      title: playbackTitle,
       mpvPath: mpvPath.value,
-      subtitleUrl: subtitleUrl.value || null,
-      audioStreamIndex: selectedAudioIndex.value,
-      subtitleStreamIndex: selectedSubtitleIndex.value,
+      subtitleUrl: playbackSubtitleUrl,
+      audioStreamIndex,
+      subtitleStreamIndex,
       startPositionSeconds,
       embedBounds,
       renderMode: 'softwareCanvas',
@@ -381,6 +522,11 @@ async function playInMpv(startPositionSecondsOverride?: number) {
         { name: 'User-Agent', value: auth.userAgent },
       ],
     })
+    if (isPlaybackStartStale(requestId, itemId, sourceId)) {
+      await reportStoppedFor(itemId, sourceId, playSessionId, startPositionSeconds)
+      return
+    }
+
     if (response.engine.includes('libmpv-render-sw')) {
       softwareRenderer.beginSoftwareRendering()
     } else {
@@ -390,11 +536,46 @@ async function playInMpv(startPositionSecondsOverride?: number) {
     void refreshEngineStatus()
     showOsd(startPositionSeconds > 0 ? `从 ${formatTime(startPositionSeconds)} 继续播放` : '播放')
   } catch (error) {
+    if (isPlaybackStartStale(requestId, itemId, sourceId)) {
+      if (didReportStart) {
+        reportStoppedFor(itemId, sourceId, playSessionId, startPositionSeconds).catch(() => {
+          // Stale startup cleanup must not block the active playback request.
+        })
+      }
+      return
+    }
+
     softwareRenderer.resetSoftwareRendering()
+    isPreparingFirstFrame.value = false
+    if (didReportStart) {
+      reportStoppedFor(itemId, sourceId, playSessionId, startPositionSeconds).catch(() => {
+        // A failed local startup should not leave the user stuck on reporting cleanup.
+      })
+    }
     errorMessage.value = normalizePlaybackStartError(error, forceTranscode.value)
   } finally {
-    isStartingPlayback.value = false
+    if (!isPlaybackStartStale(requestId, itemId, sourceId)) {
+      isStartingPlayback.value = false
+    }
   }
+}
+
+function isPlaybackStartStale(requestId: number, itemId: string, sourceId: string) {
+  return requestId !== playbackStartRequestId || props.item?.Id !== itemId || selectedSource.value?.Id !== sourceId
+}
+
+async function reportStoppedFor(
+  itemId: string,
+  sourceId: string,
+  playSessionId: string | undefined,
+  positionSeconds: number,
+) {
+  await playbackReporting.reportStopped(
+    itemId,
+    sourceId,
+    playSessionId,
+    secondsToTicks(positionSeconds),
+  )
 }
 
 async function applyPlaybackSettings() {
@@ -402,9 +583,39 @@ async function applyPlaybackSettings() {
     return
   }
 
-  const resumeSeconds = playbackPosition.value || getResumePositionSeconds()
+  const resumeSeconds = playbackPosition.value || getResumePositionSeconds(props.item)
   await restartPlaybackFrom(resumeSeconds)
   showOsd('已应用播放设置')
+}
+
+async function retryPlayback() {
+  if (!props.item) {
+    return
+  }
+
+  const resumeSeconds = playbackPosition.value || lastPlaybackPositionSeconds || getResumePositionSeconds(props.item)
+  if (selectedSource.value) {
+    await playInMpv(resumeSeconds)
+    return
+  }
+
+  isLoading.value = true
+  errorMessage.value = ''
+  try {
+    playbackInfo.value = await props.getPlaybackInfo(props.item.Id, secondsToTicks(resumeSeconds))
+    applyDefaultPlaybackStreams(playbackInfo.value.MediaSources[0])
+    await nextTick()
+    await playInMpv(resumeSeconds)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '无法重新获取 Emby 播放信息'
+  } finally {
+    isLoading.value = false
+  }
+}
+
+async function retryWithTranscode() {
+  forceTranscode.value = true
+  await retryPlayback()
 }
 
 async function togglePlayPause() {
@@ -501,7 +712,8 @@ async function maybeReportPlaybackProgress() {
 }
 
 async function maybeAutoPlayNextEpisode(currentDiagnostics: PlayerDiagnostics | null) {
-  if (!currentDiagnostics || didAutoAdvance || !nextEpisode.value) {
+  const nextItem = props.nextQueueItem ?? nextEpisode.value
+  if (!currentDiagnostics || didAutoAdvance || !nextItem) {
     return
   }
 
@@ -518,7 +730,7 @@ async function maybeAutoPlayNextEpisode(currentDiagnostics: PlayerDiagnostics | 
 
   didAutoAdvance = true
   showOsd('即将播放下一集')
-  await switchEpisode(nextEpisode.value)
+  await switchEpisode(nextItem)
 }
 
 function getPlayerBounds(): PlayerBounds | null {
@@ -535,7 +747,21 @@ function getPlayerBounds(): PlayerBounds | null {
   }
 }
 
-async function markStopped() {
+async function markStopped(positionSeconds = playbackPosition.value || lastPlaybackPositionSeconds) {
+  if (!canReportPlaybackStop()) {
+    return
+  }
+
+  didStopForExit = true
+  await reportStoppedAt(positionSeconds)
+  statusMessage.value = '已向 Emby 上报停止播放'
+}
+
+function canReportPlaybackStop() {
+  return Boolean(props.item && selectedSource.value && !didStopForExit)
+}
+
+async function reportStoppedAt(positionSeconds: number) {
   const item = props.item
   const source = selectedSource.value
   if (!item || !source) {
@@ -546,9 +772,8 @@ async function markStopped() {
     item.Id,
     source.Id,
     playbackInfo.value?.PlaySessionId,
-    secondsToTicks(playbackPosition.value),
+    secondsToTicks(positionSeconds),
   )
-  statusMessage.value = '已向 Emby 上报停止播放'
 }
 
 async function stopPlaybackForExit() {
@@ -558,7 +783,9 @@ async function stopPlaybackForExit() {
 
   didStopForExit = true
   const wasRendering = isSoftwareRendering.value || hasRenderedFrame.value || Boolean(diagnostics.value)
+  const stoppedPositionSeconds = playbackPosition.value || lastPlaybackPositionSeconds
   softwareRenderer.resetSoftwareRendering()
+  isPreparingFirstFrame.value = false
   stopDiagnosticsLoop()
   diagnostics.value = null
 
@@ -573,14 +800,21 @@ async function stopPlaybackForExit() {
   }
 
   try {
-    await markStopped()
+    await reportStoppedAt(stoppedPositionSeconds)
   } catch {
     // Reporting must not block navigation away from the player.
   }
 }
 
 async function stopPlaybackForSwitch() {
+  if (didStopForExit) {
+    return
+  }
+
+  didStopForExit = true
+  const stoppedPositionSeconds = playbackPosition.value || lastPlaybackPositionSeconds
   softwareRenderer.resetSoftwareRendering()
+  isPreparingFirstFrame.value = false
   stopDiagnosticsLoop()
   diagnostics.value = null
 
@@ -589,10 +823,17 @@ async function stopPlaybackForSwitch() {
   } catch {
     // The player may already be stopped while switching episodes.
   }
+
+  try {
+    await reportStoppedAt(stoppedPositionSeconds)
+  } catch {
+    // Switching items should not be blocked by playback reporting.
+  }
 }
 
 async function restartPlaybackFrom(positionSeconds: number) {
   softwareRenderer.resetSoftwareRendering()
+  isPreparingFirstFrame.value = false
   stopDiagnosticsLoop()
   diagnostics.value = null
 
@@ -601,6 +842,8 @@ async function restartPlaybackFrom(positionSeconds: number) {
   } catch {
     // The player may not be running yet while applying initial settings.
   }
+
+  didStopForExit = false
 
   await playInMpv(positionSeconds)
 }
@@ -615,7 +858,6 @@ async function switchEpisode(episode: EmbyItem) {
     return
   }
 
-  autoplayAfterItemChange = true
   await stopPlaybackForSwitch()
   emit('changeItem', episode)
 }
@@ -636,9 +878,11 @@ async function controlPlayer(command: 'togglePause' | 'stop' | 'toggleFullscreen
     } else if (command === 'toggleFullscreen') {
       showOsd('全屏')
     } else {
+      const stoppedPositionSeconds = playbackPosition.value || lastPlaybackPositionSeconds
       softwareRenderer.resetSoftwareRendering()
+      isPreparingFirstFrame.value = false
       stopDiagnosticsLoop()
-      await markStopped()
+      await markStopped(stoppedPositionSeconds)
       revealControls()
     }
   } catch (error) {
@@ -674,7 +918,7 @@ function revealControls() {
   controlsVisible.value = true
   clearHideControlsTimer()
 
-  if (!hasActivePlayback.value || isPaused.value || showPlayerSettings.value || showDebugPanel.value) {
+  if (!hasActivePlayback.value || isPaused.value || showPlayerSettings.value || showDebugPanel.value || showQueuePanel.value || showChapterPanel.value) {
     return
   }
 
@@ -758,21 +1002,27 @@ function handlePlayerKeydown(event: KeyboardEvent) {
     return
   }
 
+  if (key === 'm') {
+    event.preventDefault()
+    cyclePlaybackMode()
+    return
+  }
+
   if (key === 'escape' && document.fullscreenElement) {
     event.preventDefault()
     void document.exitFullscreen()
     return
   }
 
-  if ((key === ']' || key === '.') && nextEpisode.value) {
+  if ((key === ']' || key === '.') && displayNextItem.value) {
     event.preventDefault()
-    void switchEpisode(nextEpisode.value)
+    void switchEpisode(displayNextItem.value)
     return
   }
 
-  if ((key === '[' || key === ',') && previousEpisode.value) {
+  if ((key === '[' || key === ',') && displayPreviousItem.value) {
     event.preventDefault()
-    void switchEpisode(previousEpisode.value)
+    void switchEpisode(displayPreviousItem.value)
   }
 }
 
@@ -799,6 +1049,25 @@ async function copyUrl() {
   window.setTimeout(() => {
     copied.value = false
   }, 1300)
+}
+
+async function seekToChapter(chapter: PlaybackChapter) {
+  await playerEngine.seek(chapter.startSeconds)
+  await refreshDiagnostics()
+  showOsd(`跳转到 ${chapter.name}`)
+  revealControls()
+}
+
+async function skipActiveChapter() {
+  const chapter = activeSkippableChapter.value
+  if (!chapter?.endSeconds) {
+    return
+  }
+
+  await playerEngine.seek(chapter.endSeconds)
+  await refreshDiagnostics()
+  showOsd(chapter.kind === 'intro' ? '已跳过片头' : '已跳过片尾')
+  revealControls()
 }
 
 function streamsByType(source: EmbyMediaSource | null, type: EmbyMediaStream['Type']) {
@@ -837,6 +1106,23 @@ function formatSource(source: EmbyMediaSource) {
   return parts.join(' · ') || source.Id
 }
 
+function applyDefaultPlaybackStreams(source: EmbyMediaSource | undefined) {
+  selectedSourceId.value = source?.Id ?? ''
+  selectedAudioIndex.value = getPreferredStream(source, 'Audio', props.playbackPreferences.preferredAudioLanguage)?.Index ?? null
+  selectedSubtitleIndex.value = getPreferredStream(source, 'Subtitle', props.playbackPreferences.preferredSubtitleLanguage)?.Index ?? null
+}
+
+function cyclePlaybackMode() {
+  emit('cyclePlaybackMode')
+  showOsd(`播放模式：${formatPlaybackMode(getNextPlaybackMode(props.playbackMode))}`)
+}
+
+function getNextPlaybackMode(mode: PlaybackMode): PlaybackMode {
+  const modes: PlaybackMode[] = ['normal', 'repeat-all', 'repeat-one', 'shuffle']
+  const index = modes.indexOf(mode)
+  return modes[(index + 1) % modes.length]
+}
+
 function formatStream(stream: Pick<EmbyMediaStream, 'DisplayTitle' | 'Language' | 'Codec'>) {
   return stream.DisplayTitle || [stream.Language, stream.Codec].filter(Boolean).join(' · ')
 }
@@ -856,32 +1142,6 @@ function formatTime(seconds: number) {
   }
 
   return `${minutes}:${String(rest).padStart(2, '0')}`
-}
-
-function getResumePositionTicks() {
-  const positionTicks = props.item?.UserData?.PlaybackPositionTicks ?? 0
-  const runtimeTicks = props.item?.RunTimeTicks ?? 0
-  if (positionTicks <= 0) {
-    return 0
-  }
-
-  if (runtimeTicks > 0 && positionTicks >= runtimeTicks - secondsToTicks(30)) {
-    return 0
-  }
-
-  return positionTicks
-}
-
-function getResumePositionSeconds() {
-  return ticksToSeconds(getResumePositionTicks())
-}
-
-function secondsToTicks(seconds: number) {
-  return Math.max(0, Math.round(seconds * 10_000_000))
-}
-
-function ticksToSeconds(ticks: number) {
-  return Math.max(0, ticks / 10_000_000)
 }
 
 </script>
@@ -907,15 +1167,37 @@ function ticksToSeconds(ticks: number) {
         <span v-if="startupMessage">{{ startupMessage }}</span>
       </div>
 
+      <Transition name="player-loading-fade">
+        <div v-if="playbackLoadingMessage" class="mpv-stage__loading" role="status" aria-live="polite">
+          <span class="mpv-stage__loading-ring" aria-hidden="true"></span>
+          <strong>{{ playbackLoadingMessage }}</strong>
+          <p>已收到播放请求，正在连接媒体流并准备画面</p>
+        </div>
+      </Transition>
+
       <div class="mpv-stage__topbar">
-        <VBtn class="player-back" type="button" icon variant="tonal" @click="leavePlayer">
+        <VBtn class="player-back" type="button" icon variant="tonal" aria-label="返回详情" @click="leavePlayer">
           <ArrowLeft :size="20" />
         </VBtn>
         <div class="mpv-stage__title">
           <strong>{{ displayTitle }}</strong>
         </div>
-        <VBtn class="player-icon-button" type="button" icon variant="tonal" @click="showPlayerSettings = !showPlayerSettings">
+        <VBtn class="player-icon-button" type="button" icon variant="tonal" aria-label="打开播放设置" @click="showPlayerSettings = !showPlayerSettings">
           <MoreHorizontal :size="21" />
+        </VBtn>
+        <VBtn
+          v-if="playbackChapters.length"
+          class="player-icon-button"
+          type="button"
+          icon
+          variant="tonal"
+          aria-label="打开章节面板"
+          @click="showChapterPanel = !showChapterPanel"
+        >
+          <BookOpen :size="20" />
+        </VBtn>
+        <VBtn class="player-icon-button" type="button" icon variant="tonal" aria-label="打开播放队列" @click="showQueuePanel = !showQueuePanel">
+          <ListMusic :size="20" />
         </VBtn>
       </div>
 
@@ -924,13 +1206,28 @@ function ticksToSeconds(ticks: number) {
       </div>
 
       <VBtn
-        v-if="!isSoftwareRendering"
-        class="mpv-stage__center-play"
+        v-if="activeSkippableChapter"
+        class="mpv-stage__skip-chapter"
         type="button"
-        icon
-        variant="tonal"
-        :disabled="!directPlayUrl || isLoading"
-        @click="playInMpv"
+        color="primary"
+        variant="flat"
+        @click="skipActiveChapter"
+      >
+        <template #prepend>
+          <SkipForward :size="18" />
+        </template>
+        {{ activeSkippableChapter.kind === 'intro' ? '跳过片头' : '跳过片尾' }}
+      </VBtn>
+
+        <VBtn
+          v-if="!isSoftwareRendering && !isStartingPlayback"
+          class="mpv-stage__center-play"
+          type="button"
+          icon
+          variant="tonal"
+          aria-label="开始播放"
+          :disabled="!directPlayUrl || isLoading"
+          @click="() => playInMpv()"
       >
         <Play :size="30" />
       </VBtn>
@@ -944,12 +1241,14 @@ function ticksToSeconds(ticks: number) {
         :is-loading="isLoading"
         :is-paused="isPaused"
         :is-software-rendering="isSoftwareRendering"
-        :previous-episode="previousEpisode"
-        :next-episode="nextEpisode"
+        :playback-mode="playbackMode"
+        :previous-episode="displayPreviousItem"
+        :next-episode="displayNextItem"
         :episode-options="episodeOptions"
         :selected-episode-id="selectedEpisodeId"
         :format-episode-option="formatEpisodeOption"
         :format-time="formatTime"
+        :queue-label="queueLabel"
         @play-pause="togglePlayPause"
         @seek-relative="seekRelative"
         @seek-to-progress="seekFromValue"
@@ -957,12 +1256,34 @@ function ticksToSeconds(ticks: number) {
         @select-episode="selectedEpisodeId = $event"
         @switch-episode="switchEpisode"
         @update-volume="setVolumeFromValue"
+        @cycle-playback-mode="cyclePlaybackMode"
         @open-settings="showPlayerSettings = !showPlayerSettings"
         @open-debug="showDebugPanel = !showDebugPanel"
         @toggle-fullscreen="controlPlayer('toggleFullscreen')"
       />
 
+      <PlayerQueuePanel
+        v-if="showQueuePanel"
+        :items="queueItems"
+        :active-item-id="activeQueueItemId"
+        :playback-mode="playbackMode"
+        @clear="emit('clearQueue')"
+        @close="showQueuePanel = false"
+        @remove="emit('removeQueueItem', $event)"
+        @select="switchEpisode"
+      />
+
+      <PlayerChapterPanel
+        v-if="showChapterPanel"
+        :chapters="playbackChapters"
+        :playback-position="playbackPosition"
+        :format-time="formatTime"
+        @close="showChapterPanel = false"
+        @seek="seekToChapter"
+      />
+
       <PlayerSettingsPanel
+        v-if="showPlayerSettings || showDebugPanel"
         :show-settings="showPlayerSettings"
         :show-debug="showDebugPanel"
         :playback-info="playbackInfo"
@@ -999,7 +1320,24 @@ function ticksToSeconds(ticks: number) {
         type="error"
         variant="tonal"
       >
-        {{ errorMessage }}
+        <div class="player-panel__notice-content">
+          <span>{{ errorMessage }}</span>
+          <div v-if="canRetryPlayback" class="player-panel__notice-actions">
+            <VBtn size="small" variant="tonal" type="button" @click="retryPlayback">
+              重试
+            </VBtn>
+            <VBtn
+              v-if="canRetryWithTranscode"
+              size="small"
+              color="primary"
+              variant="tonal"
+              type="button"
+              @click="retryWithTranscode"
+            >
+              强制转码重试
+            </VBtn>
+          </div>
+        </div>
       </VAlert>
       <VAlert
         v-if="statusMessage"
@@ -1026,12 +1364,8 @@ function ticksToSeconds(ticks: number) {
   overflow: hidden;
   height: 100%;
   min-height: 0;
-  color: var(--color-muted);
+  color: rgba(var(--v-theme-on-surface), 0.7);
   background: #000000;
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 10px;
-  box-shadow: 0 30px 90px rgb(0 0 0 / 42%);
-  animation: player-enter var(--motion-emphasized) both;
 }
 
 .mpv-stage--controls-hidden {
@@ -1055,7 +1389,7 @@ function ticksToSeconds(ticks: number) {
   align-content: center;
   gap: 14px;
   padding: 24px;
-  background: linear-gradient(180deg, rgb(10 14 20 / 92%), rgb(1 2 4 / 94%));
+  background: #000000;
 }
 
 .mpv-stage__empty p,
@@ -1064,16 +1398,14 @@ function ticksToSeconds(ticks: number) {
 }
 
 .mpv-stage__empty p {
-  display: -webkit-box;
+  display: block;
   max-width: min(720px, 80vw);
-  overflow: hidden;
-  color: var(--color-text);
+  overflow-wrap: anywhere;
+  color: #ffffff;
   font-size: 1.28rem;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.25;
   text-align: center;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 .mpv-stage__empty span {
@@ -1082,8 +1414,52 @@ function ticksToSeconds(ticks: number) {
 }
 
 .mpv-stage__loader {
-  color: var(--color-signal);
+  color: rgb(var(--v-theme-primary));
   animation: player-spin 0.9s linear infinite;
+}
+
+.mpv-stage__loading {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  padding: 28px;
+  color: #ffffff;
+  background: rgb(0 0 0 / 72%);
+  text-align: center;
+  pointer-events: none;
+}
+
+.mpv-stage__loading-ring {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  border: 3px solid rgb(255 255 255 / 18%);
+  border-top-color: rgb(var(--v-theme-primary));
+  border-radius: 50%;
+  animation: player-spin 0.85s linear infinite;
+}
+
+.mpv-stage__loading strong,
+.mpv-stage__loading p {
+  margin: 0;
+}
+
+.mpv-stage__loading strong {
+  color: #ffffff;
+  font-size: 1.05rem;
+  font-weight: 500;
+  line-height: 1.25;
+}
+
+.mpv-stage__loading p {
+  max-width: min(420px, 80vw);
+  color: rgb(255 255 255 / 66%);
+  font-size: 0.86rem;
+  line-height: 1.45;
 }
 
 .mpv-stage__topbar,
@@ -1097,6 +1473,12 @@ function ticksToSeconds(ticks: number) {
     opacity 180ms ease,
     transform 180ms ease;
   pointer-events: auto;
+}
+
+.mpv-stage__topbar,
+.mpv-stage__controls,
+.player-panel__notice {
+  z-index: 6;
 }
 
 .mpv-stage--controls-hidden .mpv-stage__topbar,
@@ -1116,11 +1498,13 @@ function ticksToSeconds(ticks: number) {
 .mpv-stage__topbar {
   top: 0;
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  grid-template-columns: 44px minmax(0, 1fr);
+  grid-auto-columns: 44px;
+  grid-auto-flow: column;
   align-items: center;
   gap: 12px;
-  padding: 14px 16px 56px;
-  background: linear-gradient(180deg, rgb(0 0 0 / 68%), transparent);
+  padding: 14px 16px;
+  background: rgb(0 0 0 / 64%);
 }
 
 .player-back,
@@ -1129,12 +1513,7 @@ function ticksToSeconds(ticks: number) {
   width: 42px;
   height: 42px;
   place-items: center;
-  color: #ffffff;
-  background: rgb(255 255 255 / 10%);
-  border: 1px solid rgb(255 255 255 / 14%);
-  border-radius: 50%;
   cursor: pointer;
-  backdrop-filter: blur(18px);
 }
 
 .player-back:hover,
@@ -1149,13 +1528,11 @@ function ticksToSeconds(ticks: number) {
 
 .mpv-stage__title strong {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   display: block;
+  overflow-wrap: anywhere;
   color: #ffffff;
   font-size: 1.04rem;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.28;
 }
 
@@ -1168,13 +1545,8 @@ function ticksToSeconds(ticks: number) {
   width: 76px;
   height: 76px;
   place-items: center;
-  color: #ffffff;
-  background: color-mix(in srgb, var(--color-signal) 24%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-signal) 42%, white 12%);
-  border-radius: 50%;
   transform: translate(-50%, -50%);
   cursor: pointer;
-  backdrop-filter: blur(18px);
 }
 
 .mpv-stage__center-play:disabled {
@@ -1190,17 +1562,20 @@ function ticksToSeconds(ticks: number) {
   max-width: min(320px, calc(100% - 48px));
   padding: 12px 18px;
   color: #ffffff;
-  background: rgb(0 0 0 / 54%);
-  border: 1px solid rgb(255 255 255 / 14%);
-  border-radius: 10px;
-  box-shadow: 0 16px 50px rgb(0 0 0 / 35%);
+  background: rgb(0 0 0 / 58%);
+  border: 1px solid rgb(255 255 255 / 18%);
   font-size: 0.92rem;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.2;
   text-align: center;
   transform: translate(-50%, -50%);
-  backdrop-filter: blur(18px);
-  animation: osd-enter 160ms ease both;
+}
+
+.mpv-stage__skip-chapter {
+  position: absolute;
+  right: 24px;
+  bottom: 150px;
+  z-index: 5;
 }
 
 .player-panel__notice {
@@ -1211,15 +1586,24 @@ function ticksToSeconds(ticks: number) {
   z-index: 6;
 }
 
-@keyframes player-enter {
-  from {
-    opacity: 0;
-    transform: scale(0.988);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
-  }
+.player-panel__notice-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.player-panel__notice-content span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.player-panel__notice-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 @keyframes player-spin {
@@ -1228,15 +1612,15 @@ function ticksToSeconds(ticks: number) {
   }
 }
 
-@keyframes osd-enter {
-  from {
-    opacity: 0;
-    transform: translate(-50%, -45%) scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
-  }
+
+.player-loading-fade-enter-active,
+.player-loading-fade-leave-active {
+  transition: opacity 180ms ease;
+}
+
+.player-loading-fade-enter-from,
+.player-loading-fade-leave-to {
+  opacity: 0;
 }
 
 @media (max-width: 720px) {
@@ -1254,5 +1638,15 @@ function ticksToSeconds(ticks: number) {
     bottom: 170px;
     left: 12px;
   }
+
+  .player-panel__notice-content {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .player-panel__notice-actions {
+    justify-content: flex-start;
+  }
+
 }
 </style>

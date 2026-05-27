@@ -4,25 +4,31 @@ import {
   Maximize2,
   Pause,
   Play,
+  Repeat,
+  Repeat1,
   RotateCcw,
   RotateCw,
   Settings2,
+  Shuffle,
   SkipBack,
   SkipForward,
   Square,
   Volume2,
 } from 'lucide-vue-next'
 import type { EmbyItem } from '../composables/useEmbyClient'
+import type { PlaybackMode } from '../composables/usePlaybackQueue'
 
 defineProps<{
   playbackPosition: number
   playbackDuration: number
   playbackProgress: number
   volumeLevel: number
+  queueLabel: string
   canPlay: boolean
   isLoading: boolean
   isPaused: boolean
   isSoftwareRendering: boolean
+  playbackMode: PlaybackMode
   previousEpisode: Readonly<EmbyItem | null>
   nextEpisode: Readonly<EmbyItem | null>
   episodeOptions: readonly EmbyItem[]
@@ -39,10 +45,27 @@ const emit = defineEmits<{
   selectEpisode: [episodeId: string]
   switchEpisode: [episode: EmbyItem]
   updateVolume: [value: number | string]
+  cyclePlaybackMode: []
   openSettings: []
   openDebug: []
   toggleFullscreen: []
 }>()
+
+function playbackModeLabel(mode: PlaybackMode) {
+  if (mode === 'repeat-all') {
+    return '列表循环'
+  }
+
+  if (mode === 'repeat-one') {
+    return '单项循环'
+  }
+
+  if (mode === 'shuffle') {
+    return '随机播放'
+  }
+
+  return '顺序播放'
+}
 </script>
 
 <template>
@@ -69,6 +92,7 @@ const emit = defineEmits<{
         type="button"
         icon
         variant="tonal"
+        aria-label="上一项"
         :disabled="!previousEpisode"
         @click="previousEpisode && emit('switchEpisode', previousEpisode)"
       >
@@ -78,6 +102,7 @@ const emit = defineEmits<{
         type="button"
         icon
         variant="tonal"
+        aria-label="后退 10 秒"
         :disabled="!playbackDuration"
         @click="emit('seekRelative', -10)"
       >
@@ -87,6 +112,7 @@ const emit = defineEmits<{
         type="button"
         icon
         variant="tonal"
+        aria-label="播放或暂停"
         :disabled="!canPlay || isLoading"
         @click="emit('playPause')"
       >
@@ -97,6 +123,7 @@ const emit = defineEmits<{
         type="button"
         icon
         variant="tonal"
+        aria-label="前进 10 秒"
         :disabled="!playbackDuration"
         @click="emit('seekRelative', 10)"
       >
@@ -106,13 +133,26 @@ const emit = defineEmits<{
         type="button"
         icon
         variant="tonal"
+        aria-label="下一项"
         :disabled="!nextEpisode"
         @click="nextEpisode && emit('switchEpisode', nextEpisode)"
       >
         <SkipForward :size="18" />
       </VBtn>
-      <VBtn type="button" icon variant="tonal" @click="emit('stop')">
+      <VBtn type="button" icon variant="tonal" aria-label="停止播放" @click="emit('stop')">
         <Square :size="18" />
+      </VBtn>
+      <VBtn
+        type="button"
+        icon
+        variant="tonal"
+        aria-label="切换播放模式"
+        :title="playbackModeLabel(playbackMode)"
+        @click="emit('cyclePlaybackMode')"
+      >
+        <Repeat1 v-if="playbackMode === 'repeat-one'" :size="18" />
+        <Shuffle v-else-if="playbackMode === 'shuffle'" :size="18" />
+        <Repeat v-else :size="18" />
       </VBtn>
       <VSelect
         v-if="episodeOptions.length"
@@ -124,7 +164,7 @@ const emit = defineEmits<{
         density="compact"
         variant="solo-filled"
         hide-details
-        aria-label="选择分集"
+        :aria-label="queueLabel"
         @update:model-value="emit('selectEpisode', $event)"
       />
       <div class="mpv-stage__volume-group">
@@ -142,13 +182,13 @@ const emit = defineEmits<{
           @end="emit('updateVolume', $event)"
         />
       </div>
-      <VBtn type="button" icon variant="tonal" @click="emit('openSettings')">
+      <VBtn type="button" icon variant="tonal" aria-label="打开播放设置" @click="emit('openSettings')">
         <Settings2 :size="18" />
       </VBtn>
-      <VBtn type="button" icon variant="tonal" @click="emit('openDebug')">
+      <VBtn type="button" icon variant="tonal" aria-label="打开调试信息" @click="emit('openDebug')">
         <Bug :size="18" />
       </VBtn>
-      <VBtn type="button" icon variant="tonal" @click="emit('toggleFullscreen')">
+      <VBtn type="button" icon variant="tonal" aria-label="切换全屏" @click="emit('toggleFullscreen')">
         <Maximize2 :size="18" />
       </VBtn>
     </div>
@@ -161,11 +201,11 @@ const emit = defineEmits<{
   right: 0;
   bottom: 0;
   left: 0;
-  z-index: 3;
+  z-index: 6;
   display: grid;
   gap: 10px;
-  padding: 54px 22px 18px;
-  background: linear-gradient(0deg, rgb(0 0 0 / 84%) 0%, rgb(0 0 0 / 48%) 58%, transparent 100%);
+  padding: 18px 22px;
+  background: rgb(0 0 0 / 68%);
   opacity: 1;
   transition:
     opacity 180ms ease,
@@ -178,6 +218,9 @@ const emit = defineEmits<{
   grid-template-columns: 52px minmax(0, 1fr) 52px;
   align-items: center;
   gap: 10px;
+  max-width: 1120px;
+  width: 100%;
+  justify-self: center;
 }
 
 .mpv-stage__control-row {
@@ -191,21 +234,12 @@ const emit = defineEmits<{
 .mpv-stage__control-row :deep(.v-btn) {
   width: 40px;
   height: 40px;
-  color: #ffffff;
-  background: rgb(255 255 255 / 12%);
-  border: 1px solid rgb(255 255 255 / 15%);
-  border-radius: 50%;
-  backdrop-filter: blur(12px);
-}
-
-.mpv-stage__control-row :deep(.v-btn:hover) {
-  background: rgb(255 255 255 / 17%);
 }
 
 .mpv-stage__time {
   flex: 0 0 auto;
   min-width: 0;
-  color: rgb(255 255 255 / 72%);
+  color: rgb(255 255 255 / 76%);
   font-size: 0.78rem;
   font-variant-numeric: tabular-nums;
   text-align: center;
@@ -231,10 +265,6 @@ const emit = defineEmits<{
 
 .mpv-stage__episode-select :deep(.v-field) {
   min-height: 40px;
-  color: #ffffff;
-  background: rgb(255 255 255 / 8%);
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 8px;
 }
 
 .mpv-stage__episode-select :deep(.v-field__input) {
@@ -251,9 +281,6 @@ const emit = defineEmits<{
   margin-left: 8px;
   padding: 0 10px;
   height: 40px;
-  background: rgb(255 255 255 / 8%);
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 8px;
 }
 
 .mpv-stage__volume-icon {

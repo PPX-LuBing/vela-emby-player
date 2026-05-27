@@ -1,5 +1,6 @@
 import { computed, type ComputedRef } from 'vue'
 import type { EmbyItem } from './useEmbyClient'
+import { isItemCollection } from './mediaItemDisplay'
 
 interface UseEpisodeQueueOptions {
   item: ComputedRef<Readonly<EmbyItem | null>>
@@ -10,30 +11,37 @@ interface UseEpisodeQueueOptions {
 export function useEpisodeQueue(options: UseEpisodeQueueOptions) {
   const episodeOptions = computed(() => {
     const item = options.item.value
-    if (item?.Type !== 'Episode') {
+    if (!item || !isPlayableQueueItem(item)) {
       return []
     }
 
-    const currentSeriesId = item.SeriesId
-    const currentSeriesName = item.SeriesName
+    if (item.Type === 'MusicArtist') {
+      return [...options.episodes.value]
+        .filter((episode) => episode.Type === 'Audio')
+        .sort(compareEpisodes)
+    }
+
+    if (isItemCollection(item)) {
+      return [...options.episodes.value]
+        .filter(isPlayableQueueItem)
+        .sort(compareEpisodes)
+    }
+
+    const currentGroupKey = getQueueGroupKey(item)
     return [...options.episodes.value]
       .filter((episode) => {
-        if (episode.Type !== 'Episode') {
+        if (!isPlayableQueueItem(episode)) {
           return false
         }
 
-        if (currentSeriesId && episode.SeriesId) {
-          return episode.SeriesId === currentSeriesId
-        }
-
-        return !currentSeriesName || episode.SeriesName === currentSeriesName
+        return matchesQueueGroup(item, episode, currentGroupKey)
       })
       .sort(compareEpisodes)
   })
 
   const currentEpisodeIndex = computed(() => {
     const item = options.item.value
-    if (!item || !episodeOptions.value.length) {
+    if (!item || !episodeOptions.value.length || isQueueRoot(item)) {
       return -1
     }
 
@@ -41,11 +49,19 @@ export function useEpisodeQueue(options: UseEpisodeQueueOptions) {
   })
 
   const previousEpisode = computed(() => {
+    if (options.item.value && isQueueRoot(options.item.value)) {
+      return null
+    }
+
     const index = currentEpisodeIndex.value
     return index > 0 ? episodeOptions.value[index - 1] : null
   })
 
   const nextEpisode = computed(() => {
+    if (options.item.value && isQueueRoot(options.item.value)) {
+      return episodeOptions.value[0] ?? null
+    }
+
     const index = currentEpisodeIndex.value
     return index >= 0 && index < episodeOptions.value.length - 1
       ? episodeOptions.value[index + 1]
@@ -53,7 +69,9 @@ export function useEpisodeQueue(options: UseEpisodeQueueOptions) {
   })
 
   const selectedEpisodeId = computed({
-    get: () => options.item.value?.Id ?? '',
+    get: () => episodeOptions.value.find((candidate) => candidate.Id === options.item.value?.Id)?.Id
+      ?? episodeOptions.value[0]?.Id
+      ?? '',
     set: (episodeId: string) => {
       const episode = episodeOptions.value.find((candidate) => candidate.Id === episodeId)
       if (episode) {
@@ -87,7 +105,54 @@ function compareEpisodes(first: EmbyItem, second: EmbyItem) {
   return first.Name.localeCompare(second.Name)
 }
 
+function isPlayableQueueItem(item: EmbyItem) {
+  return ['Episode', 'Audio', 'MusicArtist', 'MusicAlbum', 'Movie', 'MusicVideo', 'BoxSet', 'Playlist'].includes(item.Type)
+}
+
+function isQueueRoot(item: EmbyItem) {
+  return item.Type === 'MusicArtist' || item.Type === 'MusicAlbum' || isItemCollection(item)
+}
+
+function getQueueGroupKey(item: EmbyItem) {
+  if (item.Type === 'Episode') {
+    return item.SeriesId || item.SeriesName?.trim().toLowerCase() || item.Name.trim().toLowerCase()
+  }
+
+  if (item.Type === 'MusicAlbum') {
+    return item.Id
+  }
+
+  if (item.Type === 'Audio') {
+    return item.AlbumId || item.ParentId || item.Album?.trim().toLowerCase() || item.Name.trim().toLowerCase()
+  }
+
+  return ''
+}
+
+function matchesQueueGroup(current: EmbyItem, candidate: EmbyItem, currentGroupKey: string) {
+  if (!currentGroupKey) {
+    return false
+  }
+
+  if (current.Type === 'Episode' && candidate.Type !== 'Episode') {
+    return false
+  }
+
+  if ((current.Type === 'Audio' || current.Type === 'MusicAlbum') && candidate.Type !== 'Audio') {
+    return false
+  }
+
+  const candidateGroupKey = getQueueGroupKey(candidate)
+  return Boolean(candidateGroupKey && candidateGroupKey === currentGroupKey)
+}
+
 function formatEpisodeOption(episode: EmbyItem) {
+  if (episode.Type === 'Audio') {
+    const disc = episode.ParentIndexNumber ? `D${String(episode.ParentIndexNumber).padStart(2, '0')}` : 'D00'
+    const track = episode.IndexNumber ? `T${String(episode.IndexNumber).padStart(2, '0')}` : 'Track'
+    return `${disc}${track}  ${episode.Name}`
+  }
+
   const season = episode.ParentIndexNumber
     ? `S${String(episode.ParentIndexNumber).padStart(2, '0')}`
     : 'S00'

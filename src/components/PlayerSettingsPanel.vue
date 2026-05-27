@@ -178,18 +178,18 @@ const emit = defineEmits<{
   width: min(560px, calc(100% - 36px));
   gap: 12px;
   padding: 14px;
-  background: rgb(8 11 16 / 88%);
-  border: 1px solid rgb(255 255 255 / 12%);
-  border-radius: 10px;
-  box-shadow: 0 22px 70px rgb(0 0 0 / 42%);
-  backdrop-filter: blur(22px);
-  animation: settings-enter var(--motion-medium) both;
+  background: rgb(var(--v-theme-surface));
+  border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
 .player-settings__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.player-settings__grid :deep(.v-field) {
+  background: rgb(var(--v-theme-surface));
 }
 
 .player-settings__switch {
@@ -217,28 +217,14 @@ const emit = defineEmits<{
   gap: 10px;
   align-items: center;
   min-width: 0;
-  color: var(--color-muted);
+  color: rgb(255 255 255 / 58%);
   font-size: 0.78rem;
 }
 
 .player-debug strong {
   min-width: 0;
-  overflow: hidden;
-  color: var(--color-text);
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-@keyframes settings-enter {
-  from {
-    opacity: 0;
-    transform: translateY(12px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+  overflow-wrap: anywhere;
+  font-weight: 500;
 }
 
 @media (max-width: 720px) {

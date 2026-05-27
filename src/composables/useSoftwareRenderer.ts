@@ -7,6 +7,7 @@ interface UseSoftwareRendererOptions {
   getBounds: () => PlayerBounds | null
   renderFrame: ReturnType<typeof usePlayerEngine>['renderFrame']
   onError: (error: unknown) => void
+  onVisibleFrame?: () => void
 }
 
 export function useSoftwareRenderer(options: UseSoftwareRendererOptions) {
@@ -16,10 +17,12 @@ export function useSoftwareRenderer(options: UseSoftwareRendererOptions) {
     () => isSoftwareRendering.value || hasRenderedFrame.value,
   )
   let renderLoopId = 0
+  let invisibleFrameCount = 0
 
   function beginSoftwareRendering() {
     isSoftwareRendering.value = true
     hasRenderedFrame.value = false
+    invisibleFrameCount = 0
     startRenderLoop()
   }
 
@@ -27,6 +30,7 @@ export function useSoftwareRenderer(options: UseSoftwareRendererOptions) {
     stopRenderLoop()
     isSoftwareRendering.value = false
     hasRenderedFrame.value = false
+    invisibleFrameCount = 0
   }
 
   function stopRenderLoop() {
@@ -63,12 +67,26 @@ export function useSoftwareRenderer(options: UseSoftwareRendererOptions) {
 
     try {
       const frame = await options.renderFrame({ width, height })
-      drawRgbaFrame(canvas, frame)
-      hasRenderedFrame.value = true
+      const pixels = decodeRgbaFrame(frame.rgbaBase64)
+      drawRgbaFrame(canvas, frame.width, frame.height, pixels)
+      if (!hasRenderedFrame.value && isFirstDisplayableFrame(pixels)) {
+        hasRenderedFrame.value = true
+        options.onVisibleFrame?.()
+      }
     } catch (error) {
       options.onError(error)
       stopRenderLoop()
+      isSoftwareRendering.value = false
     }
+  }
+
+  function isFirstDisplayableFrame(pixels: Uint8ClampedArray<ArrayBuffer>) {
+    if (hasVisibleFrame(pixels)) {
+      return true
+    }
+
+    invisibleFrameCount += 1
+    return invisibleFrameCount >= 90
   }
 
   return {
@@ -81,25 +99,46 @@ export function useSoftwareRenderer(options: UseSoftwareRendererOptions) {
   }
 }
 
-function drawRgbaFrame(
-  canvas: HTMLCanvasElement,
-  frame: { width: number; height: number; rgbaBase64: string },
-) {
-  const context = canvas.getContext('2d')
-  if (!context) {
-    return
+function hasVisibleFrame(pixels: Uint8ClampedArray<ArrayBuffer>) {
+  const pixelCount = Math.floor(pixels.length / 4)
+  const pixelStep = Math.max(1, Math.floor(pixelCount / 96))
+  for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += pixelStep) {
+    const index = pixelIndex * 4
+    const red = pixels[index]
+    const green = pixels[index + 1]
+    const blue = pixels[index + 2]
+    if (red > 8 || green > 8 || blue > 8) {
+      return true
+    }
   }
 
-  canvas.width = frame.width
-  canvas.height = frame.height
-  const binary = atob(frame.rgbaBase64)
-  const pixels = new Uint8ClampedArray(binary.length)
+  return false
+}
+
+function decodeRgbaFrame(rgbaBase64: string): Uint8ClampedArray<ArrayBuffer> {
+  const binary = atob(rgbaBase64)
+  const pixels = new Uint8ClampedArray(new ArrayBuffer(binary.length))
   for (let index = 0; index < binary.length; index += 1) {
     pixels[index] = binary.charCodeAt(index)
   }
   for (let index = 3; index < pixels.length; index += 4) {
     pixels[index] = 255
   }
+  return pixels
+}
 
-  context.putImageData(new ImageData(pixels, frame.width, frame.height), 0, 0)
+function drawRgbaFrame(
+  canvas: HTMLCanvasElement,
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray<ArrayBuffer>,
+) {
+  const context = canvas.getContext('2d')
+  if (!context) {
+    return
+  }
+
+  canvas.width = width
+  canvas.height = height
+  context.putImageData(new ImageData(pixels, width, height), 0, 0)
 }

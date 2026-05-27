@@ -1,9 +1,28 @@
 <script setup lang="ts">
-import { computed, shallowRef, watch } from 'vue'
-import { Check, Clapperboard, Film, Library, Search, Tv } from 'lucide-vue-next'
+import { computed, onBeforeUnmount, shallowRef, useTemplateRef, watch } from 'vue'
+import { ChevronLeft, ChevronRight, Clapperboard, Clock3, Film, Library, RadioTower, Search } from 'lucide-vue-next'
 import type { EmbyItem, EmbyLibrary, LibrarySortKey, SortOrder } from '../composables/useEmbyClient'
+import { isProgramAiringNow } from '../composables/embyLiveTvApi'
+import {
+  formatRuntimeMinutes,
+  hasPlaybackProgress,
+  isItemCollection,
+} from '../composables/mediaItemDisplay'
+import {
+  createDefaultLibraryAdvancedFilters,
+  createLibraryAdvancedFilterOptions,
+  filterItemsByAdvancedFilters,
+  hasActiveLibraryAdvancedFilters,
+  type LibraryAdvancedFilterState,
+} from '../composables/libraryFilters'
+import LibraryAdvancedFilters from './LibraryAdvancedFilters.vue'
+import LibraryMediaCard from './LibraryMediaCard.vue'
+import LiveTvGuideTimeline from './LiveTvGuideTimeline.vue'
+import MediaRowSection from './MediaRowSection.vue'
+import PlaybackHistoryView from './PlaybackHistoryView.vue'
 
 type LibraryFilterKey = 'all' | 'favorites' | 'unplayed' | 'resumable'
+type LibraryVirtualTab = 'home' | 'live-tv' | 'playback-history'
 
 const sortOptions: { label: string; value: LibrarySortKey }[] = [
   { label: '名称', value: 'SortName' },
@@ -23,17 +42,45 @@ const filterOptions: { label: string; value: LibraryFilterKey }[] = [
   { label: '仅未看', value: 'unplayed' },
   { label: '继续观看', value: 'resumable' },
 ]
+const programTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit',
+  minute: '2-digit',
+})
+
+interface LiveTvChannelMeta {
+  currentProgramName: string
+  programRows: {
+    id: string
+    name: string
+    time: string
+  }[]
+}
 
 const props = defineProps<{
   libraries: readonly EmbyLibrary[]
   items: readonly EmbyItem[]
   itemsTotalCount: number
+  itemsLoadedCount: number
+  itemsCanLoadMore: boolean
   resumeItems: readonly EmbyItem[]
+  resumeHistoryItems: readonly EmbyItem[]
+  resumeItemsTotalCount: number
+  resumeItemsCanLoadMore: boolean
+  nextUpItems: readonly EmbyItem[]
+  playedItems: readonly EmbyItem[]
+  playedHistoryItems: readonly EmbyItem[]
+  playedItemsTotalCount: number
+  playedItemsCanLoadMore: boolean
   latestItems: readonly EmbyItem[]
   favoriteItems: readonly EmbyItem[]
+  liveTvChannels: readonly EmbyItem[]
+  liveTvProgramsByChannel: Readonly<Record<string, readonly EmbyItem[]>>
+  searchQuery: string
   searchResults: readonly EmbyItem[]
   searchTotalCount: number
-  selectedItem: Readonly<EmbyItem | null>
+  searchResultsLoadedCount: number
+  searchResultsCanLoadMore: boolean
+  selectedItem: EmbyItem | null
   isBusy: boolean
   librarySortBy: LibrarySortKey
   librarySortOrder: SortOrder
@@ -41,28 +88,53 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
+  'update:searchQuery': [query: string]
   changeSort: [payload: { sortBy: LibrarySortKey; sortOrder: SortOrder }]
+  clearPlaybackProgress: [item: EmbyItem]
   loadMore: []
+  loadMorePlayed: []
+  loadMoreResume: []
   loadMoreSearch: []
+  refreshLiveTv: []
   search: [query: string]
   selectLibrary: [library: EmbyLibrary]
   selectItem: [item: EmbyItem]
 }>()
 
-const activeLibraryId = shallowRef('')
+const activeLibraryId = shallowRef<LibraryVirtualTab | string>('home')
 const query = shallowRef('')
 const libraryFilter = shallowRef<LibraryFilterKey>('all')
+const advancedFilters = shallowRef<LibraryAdvancedFilterState>(createDefaultLibraryAdvancedFilters())
+const libraryTabsRef = useTemplateRef<HTMLElement>('libraryTabs')
 let searchTimer = 0
-const hasSelectedLibrary = computed(() => Boolean(activeLibraryId.value))
-const hasHomeRows = computed(() => Boolean(props.resumeItems.length || props.latestItems.length || props.favoriteItems.length))
+let lastEmittedSearchQuery = ''
+const hasSelectedLibrary = computed(() => !['home', 'live-tv', 'playback-history', ''].includes(activeLibraryId.value))
+const isLiveTvView = computed(() => activeLibraryId.value === 'live-tv')
+const isPlaybackHistoryView = computed(() => activeLibraryId.value === 'playback-history')
+const hasHomeRows = computed(() => Boolean(
+  props.resumeItems.length ||
+  props.nextUpItems.length ||
+  props.playedItems.length ||
+  props.latestItems.length ||
+  props.favoriteItems.length ||
+  props.liveTvChannels.length,
+))
 const normalizedQuery = computed(() => query.value.trim())
 const isSearching = computed(() => normalizedQuery.value.length >= 2)
-const canLoadMore = computed(() => hasSelectedLibrary.value && props.items.length < props.itemsTotalCount)
-const canLoadMoreSearch = computed(() => isSearching.value && props.searchResults.length < props.searchTotalCount)
+const canLoadMore = computed(() => hasSelectedLibrary.value && props.itemsCanLoadMore)
+const canLoadMoreSearch = computed(() => isSearching.value && props.searchResultsCanLoadMore)
+const searchCountLabel = computed(() => {
+  const total = props.searchTotalCount || props.searchResultsLoadedCount || props.searchResults.length
+  return `${props.searchResultsLoadedCount || props.searchResults.length} / ${total} 项`
+})
+const advancedFilterOptions = computed(() => createLibraryAdvancedFilterOptions(props.items))
+const hasActiveAdvancedFilters = computed(() => hasActiveLibraryAdvancedFilters(advancedFilters.value))
+const liveTvNow = shallowRef(Date.now())
+let liveTvClockTimer = 0
 
 const filteredItems = computed(() => {
   const localQuery = normalizedQuery.value.toLowerCase()
-  return props.items.filter((item) => {
+  return filterItemsByAdvancedFilters(props.items, advancedFilters.value).filter((item) => {
     if (!matchesLibraryFilter(item)) {
       return false
     }
@@ -71,27 +143,124 @@ const filteredItems = computed(() => {
       return true
     }
 
-    const haystack = [item.Name, item.SeriesName, item.ProductionYear]
+    const haystack = [
+      item.Name,
+      item.SeriesName,
+      item.Album,
+      item.AlbumArtist,
+      item.AlbumArtists?.join(' '),
+      item.Artists?.join(' '),
+      item.ProductionYear,
+    ]
       .filter(Boolean)
       .join(' ')
       .toLowerCase()
     return haystack.includes(localQuery)
   })
 })
+const libraryCountLabel = computed(() => {
+  const total = props.itemsTotalCount || props.itemsLoadedCount || filteredItems.value.length
+  return `${filteredItems.value.length} / ${total} 项`
+})
 
 const activeFilterLabel = computed(() => {
-  return filterOptions.find((option) => option.value === libraryFilter.value)?.label ?? '全部'
+  const labels = [filterOptions.find((option) => option.value === libraryFilter.value)?.label ?? '全部']
+  const typeLabel = advancedFilterOptions.value.types.find((option) => option.value === advancedFilters.value.type)?.label
+  const yearLabel = advancedFilterOptions.value.years.find((option) => option.value === advancedFilters.value.year)?.label
+  const genreLabel = advancedFilterOptions.value.genres.find((option) => option.value === advancedFilters.value.genre)?.label
+
+  if (advancedFilters.value.type !== 'all' && typeLabel) {
+    labels.push(typeLabel)
+  }
+  if (advancedFilters.value.year !== 'all' && yearLabel) {
+    labels.push(yearLabel)
+  }
+  if (advancedFilters.value.genre !== 'all' && genreLabel) {
+    labels.push(genreLabel)
+  }
+
+  return labels.join('、')
+})
+
+const liveTvChannelMetaById = computed<Record<string, LiveTvChannelMeta>>(() => {
+  const now = liveTvNow.value
+  const metaById: Record<string, LiveTvChannelMeta> = {}
+
+  for (const channel of props.liveTvChannels) {
+    const programs = props.liveTvProgramsByChannel[channel.Id] ?? []
+    const currentProgram = programs.find((program) => isProgramAiringNow(program, now))
+      ?? (isProgramAiringNow(channel.CurrentProgram, now) ? channel.CurrentProgram : null)
+    const programRows = programs
+      .filter((program) => {
+        const start = Date.parse(program.StartDate ?? '')
+        return Number.isFinite(start) && start > now
+      })
+      .slice(0, 3)
+      .map((program) => ({
+        id: program.Id,
+        name: program.Name ?? '未命名节目',
+        time: formatProgramTime(program),
+      }))
+
+    metaById[channel.Id] = {
+      currentProgramName: currentProgram?.Name ?? '',
+      programRows,
+    }
+  }
+
+  return metaById
 })
 
 watch(normalizedQuery, (nextQuery) => {
+  if (nextQuery !== props.searchQuery) {
+    emit('update:searchQuery', nextQuery)
+  }
+
   if (searchTimer) {
     window.clearTimeout(searchTimer)
+    searchTimer = 0
+  }
+
+  if (nextQuery.length < 2) {
+    if (lastEmittedSearchQuery) {
+      lastEmittedSearchQuery = ''
+      emit('search', '')
+    }
+    return
   }
 
   searchTimer = window.setTimeout(() => {
+    lastEmittedSearchQuery = nextQuery
     emit('search', nextQuery)
-  }, nextQuery.length >= 2 ? 250 : 0)
+  }, 250)
 })
+
+watch(
+  () => props.searchQuery,
+  (nextQuery) => {
+    const normalizedSearchQuery = nextQuery.trim()
+    if (normalizedSearchQuery !== query.value) {
+      query.value = normalizedSearchQuery
+    }
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (searchTimer) {
+    window.clearTimeout(searchTimer)
+  }
+  stopLiveTvClock()
+})
+
+watch(isLiveTvView, (active) => {
+  if (active) {
+    startLiveTvClock()
+    return
+  }
+
+  stopLiveTvClock()
+}, { immediate: true })
 
 function changeSortBy(sortBy: LibrarySortKey) {
   emit('changeSort', { sortBy, sortOrder: props.librarySortOrder })
@@ -103,13 +272,36 @@ function changeSortOrder(sortOrder: SortOrder) {
 
 function selectLibrary(library: EmbyLibrary) {
   activeLibraryId.value = library.Id
-  libraryFilter.value = 'all'
+  resetLibraryFilters()
   emit('selectLibrary', library)
 }
 
 function showHome() {
-  activeLibraryId.value = ''
+  activeLibraryId.value = 'home'
+  resetLibraryFilters()
+  query.value = ''
+}
+
+function showLiveTv() {
+  activeLibraryId.value = 'live-tv'
+  resetLibraryFilters()
+  query.value = ''
+  emit('refreshLiveTv')
+}
+
+function showPlaybackHistory() {
+  activeLibraryId.value = 'playback-history'
+  resetLibraryFilters()
+  query.value = ''
+}
+
+function updateAdvancedFilters(filters: LibraryAdvancedFilterState) {
+  advancedFilters.value = filters
+}
+
+function resetLibraryFilters() {
   libraryFilter.value = 'all'
+  advancedFilters.value = createDefaultLibraryAdvancedFilters()
 }
 
 function matchesLibraryFilter(item: EmbyItem) {
@@ -128,14 +320,38 @@ function matchesLibraryFilter(item: EmbyItem) {
   return true
 }
 
-function scrollTabs(event: WheelEvent) {
+function scrollTabsWithWheel(event: WheelEvent) {
   const target = event.currentTarget
-  if (!(target instanceof HTMLElement) || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+  if (!(target instanceof HTMLElement)) {
+    return
+  }
+
+  const primaryDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+  if (primaryDelta === 0 || target.scrollWidth <= target.clientWidth) {
+    return
+  }
+
+  const maxScrollLeft = target.scrollWidth - target.clientWidth
+  const nextScrollLeft = Math.min(maxScrollLeft, Math.max(0, target.scrollLeft + primaryDelta))
+  if (nextScrollLeft === target.scrollLeft) {
     return
   }
 
   event.preventDefault()
-  target.scrollLeft += event.deltaY
+  target.scrollLeft = nextScrollLeft
+}
+
+function scrollLibraryTabs(direction: 'previous' | 'next') {
+  const tabs = libraryTabsRef.value
+  if (!tabs) {
+    return
+  }
+
+  const distance = Math.max(180, Math.round(tabs.clientWidth * 0.72))
+  tabs.scrollBy({
+    left: direction === 'next' ? distance : -distance,
+    behavior: 'smooth',
+  })
 }
 
 function formatMeta(item: EmbyItem) {
@@ -146,45 +362,101 @@ function formatMeta(item: EmbyItem) {
       parts.push(`${count} 集`)
     }
   }
+  if (item.Type === 'MusicAlbum') {
+    const count = item.RecursiveItemCount ?? item.ChildCount ?? item.UserData?.UnplayedItemCount
+    const artist = item.AlbumArtist || item.AlbumArtists?.[0] || item.Artists?.[0]
+    if (artist) {
+      parts.push(artist)
+    }
+    if (count) {
+      parts.push(`${count} 首`)
+    }
+  }
+  if (item.Type === 'MusicArtist') {
+    const count = item.RecursiveItemCount ?? item.ChildCount
+    parts.push('艺术家')
+    if (count) {
+      parts.push(`${count} 项`)
+    }
+  }
+  if (isItemCollection(item)) {
+    const count = item.RecursiveItemCount ?? item.ChildCount
+    if (count) {
+      parts.push(`${count} 项`)
+    }
+  }
   if (item.Type === 'Episode' && item.SeriesName) {
     parts.push(item.SeriesName)
+  }
+  if (item.Type === 'Audio') {
+    if (item.Album) {
+      parts.push(item.Album)
+    }
+    const artist = item.AlbumArtist || item.AlbumArtists?.[0] || item.Artists?.[0]
+    if (artist) {
+      parts.push(artist)
+    }
+  }
+  if (item.Type === 'TvChannel') {
+    if (item.ChannelNumber || item.Number) {
+      parts.push(`频道 ${item.ChannelNumber || item.Number}`)
+    }
+    if (item.CurrentProgram?.Name) {
+      parts.push(item.CurrentProgram.Name)
+    }
   }
   if (item.ProductionYear) {
     parts.push(String(item.ProductionYear))
   }
-  if (item.RunTimeTicks) {
-    parts.push(`${Math.round(item.RunTimeTicks / 600_000_000)} 分钟`)
+  const runtime = formatRuntimeMinutes(item.RunTimeTicks)
+  if (runtime) {
+    parts.push(runtime)
   }
 
   return parts.join(' · ') || item.Type
 }
 
-function isTvItem(item: EmbyItem) {
-  return item.Type === 'Series' || item.Type === 'Episode'
-}
-
-function progressPercent(item: EmbyItem) {
-  const percent = item.UserData?.PlayedPercentage
-  if (typeof percent === 'number') {
-    return Math.min(100, Math.max(0, percent))
+function formatProgramTime(program: EmbyItem) {
+  const start = Date.parse(program.StartDate ?? '')
+  const end = Date.parse(program.EndDate ?? '')
+  if (!Number.isFinite(start)) {
+    return ''
   }
 
-  const position = item.UserData?.PlaybackPositionTicks ?? 0
-  const runtime = item.RunTimeTicks ?? 0
-  if (!runtime) {
-    return 0
+  const startLabel = programTimeFormatter.format(start)
+
+  if (!Number.isFinite(end)) {
+    return startLabel
   }
 
-  return Math.min(100, Math.max(0, (position / runtime) * 100))
+  const endLabel = programTimeFormatter.format(end)
+  return `${startLabel}-${endLabel}`
 }
 
-function hasPlaybackProgress(item: EmbyItem) {
-  const percent = progressPercent(item)
-  return percent > 0 && percent < 98 && !item.UserData?.Played
+function liveTvChannelMeta(channel: EmbyItem) {
+  return liveTvChannelMetaById.value[channel.Id] ?? { currentProgramName: '', programRows: [] }
 }
 
-function isPlayed(item: EmbyItem) {
-  return Boolean(item.UserData?.Played)
+function currentProgramNameFor(item: EmbyItem) {
+  return liveTvChannelMeta(item).currentProgramName || item.CurrentProgram?.Name || ''
+}
+
+function startLiveTvClock() {
+  liveTvNow.value = Date.now()
+  if (liveTvClockTimer) {
+    return
+  }
+
+  liveTvClockTimer = window.setInterval(() => {
+    liveTvNow.value = Date.now()
+  }, 60_000)
+}
+
+function stopLiveTvClock() {
+  if (liveTvClockTimer) {
+    window.clearInterval(liveTvClockTimer)
+    liveTvClockTimer = 0
+  }
 }
 
 </script>
@@ -199,7 +471,7 @@ function isPlayed(item: EmbyItem) {
         v-model.trim="query"
         class="library-browser__search"
         type="search"
-        placeholder="搜索影片或剧集"
+        placeholder="搜索影片、剧集、音乐或频道"
         density="compact"
         variant="solo-filled"
         hide-details
@@ -211,31 +483,73 @@ function isPlayed(item: EmbyItem) {
     </VSheet>
 
       <div v-if="libraries.length" class="library-tabs-shell">
-        <div class="library-tabs" aria-label="媒体库列表" @wheel="scrollTabs">
-        <VChip
-          class="library-tabs__button"
-          :color="!hasSelectedLibrary ? 'primary' : undefined"
-          :variant="!hasSelectedLibrary ? 'flat' : 'tonal'"
-          label
-          @click="showHome"
+        <VBtn
+          class="library-tabs-arrow library-tabs-arrow--previous"
+          type="button"
+          icon
+          variant="tonal"
+          aria-label="上一组媒体库标签"
+          @click="scrollLibraryTabs('previous')"
         >
-          <Clapperboard :size="16" />
-          首页
-        </VChip>
-        <VChip
-          v-for="library in libraries"
-          :key="library.Id"
-          class="library-tabs__button"
-          :color="activeLibraryId === library.Id ? 'primary' : undefined"
-          :variant="activeLibraryId === library.Id ? 'flat' : 'tonal'"
-          label
-          @click="selectLibrary(library)"
+          <ChevronLeft :size="20" />
+        </VBtn>
+
+        <div ref="libraryTabs" class="library-tabs" aria-label="媒体库列表" @wheel="scrollTabsWithWheel">
+          <VChip
+            class="library-tabs__button"
+            :color="activeLibraryId === 'home' ? 'primary' : undefined"
+            :variant="activeLibraryId === 'home' ? 'flat' : 'tonal'"
+            label
+            @click="showHome"
+          >
+            <Clapperboard :size="16" />
+            首页
+          </VChip>
+          <VChip
+            class="library-tabs__button"
+            :color="isPlaybackHistoryView ? 'primary' : undefined"
+            :variant="isPlaybackHistoryView ? 'flat' : 'tonal'"
+            label
+            @click="showPlaybackHistory"
+          >
+            <Clock3 :size="16" />
+            播放历史
+          </VChip>
+          <VChip
+            class="library-tabs__button"
+            :color="isLiveTvView ? 'primary' : undefined"
+            :variant="isLiveTvView ? 'flat' : 'tonal'"
+            label
+            @click="showLiveTv"
+          >
+            <RadioTower :size="16" />
+            电视直播
+          </VChip>
+          <VChip
+            v-for="library in libraries"
+            :key="library.Id"
+            class="library-tabs__button"
+            :color="activeLibraryId === library.Id ? 'primary' : undefined"
+            :variant="activeLibraryId === library.Id ? 'flat' : 'tonal'"
+            label
+            @click="selectLibrary(library)"
+          >
+            <Library :size="16" />
+            {{ library.Name }}
+          </VChip>
+        </div>
+
+        <VBtn
+          class="library-tabs-arrow library-tabs-arrow--next"
+          type="button"
+          icon
+          variant="tonal"
+          aria-label="下一组媒体库标签"
+          @click="scrollLibraryTabs('next')"
         >
-          <Library :size="16" />
-          {{ library.Name }}
-        </VChip>
+          <ChevronRight :size="20" />
+        </VBtn>
       </div>
-    </div>
 
     <VSheet v-if="!libraries.length" class="empty-state">
       <Clapperboard :size="28" />
@@ -247,7 +561,7 @@ function isPlayed(item: EmbyItem) {
         <div>
           <h3 class="shelf-heading__title">搜索结果</h3>
         </div>
-        <span>{{ searchResults.length }} / {{ searchTotalCount || searchResults.length }} 项</span>
+        <span>{{ searchCountLabel }}</span>
       </div>
 
       <VSheet v-if="!searchResults.length" class="empty-state">
@@ -256,37 +570,15 @@ function isPlayed(item: EmbyItem) {
       </VSheet>
 
       <div v-else class="media-grid">
-        <VCard
+        <LibraryMediaCard
           v-for="item in searchResults"
           :key="`search-${item.Id}`"
-          class="media-card"
-          :class="{ 'media-card--active': selectedItem?.Id === item.Id }"
-          tag="button"
-          type="button"
-          variant="flat"
-          @click="emit('selectItem', item)"
-        >
-          <span class="media-card__poster">
-            <img
-              v-if="getImageUrl(item)"
-              :src="getImageUrl(item, 360)"
-              :alt="item.Name"
-              loading="lazy"
-            />
-            <Tv v-else-if="isTvItem(item)" :size="34" />
-            <Film v-else :size="34" />
-            <span v-if="isPlayed(item)" class="media-card__played" title="已观看">
-              <Check :size="13" />
-            </span>
-            <span v-else-if="hasPlaybackProgress(item)" class="media-card__progress">
-              <i :style="{ width: `${progressPercent(item)}%` }"></i>
-            </span>
-          </span>
-          <span class="media-card__body">
-            <span class="media-card__name">{{ item.Name }}</span>
-            <span class="media-card__meta">{{ formatMeta(item) }}</span>
-          </span>
-        </VCard>
+          :item="item"
+          :selected="selectedItem?.Id === item.Id"
+          :meta="formatMeta(item)"
+          :get-image-url="getImageUrl"
+          @select-item="emit('selectItem', $event)"
+        />
       </div>
 
       <div v-if="canLoadMoreSearch" class="load-more-row">
@@ -296,135 +588,75 @@ function isPlayed(item: EmbyItem) {
       </div>
     </section>
 
-    <div v-else-if="!hasSelectedLibrary" class="home-sections">
-      <section v-if="favoriteItems.length" class="media-row-section">
-        <div class="shelf-heading">
-          <div>
-            <h3 class="shelf-heading__title">我的收藏</h3>
-          </div>
-          <span>{{ favoriteItems.length }} 项</span>
-        </div>
+    <div v-else-if="activeLibraryId === 'home'" class="home-sections">
+      <MediaRowSection
+        v-if="favoriteItems.length"
+        title="我的收藏"
+        :count-label="`${favoriteItems.length} 项`"
+        :items="favoriteItems"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        :get-current-program-name="currentProgramNameFor"
+        @select-item="emit('selectItem', $event)"
+      />
 
-        <div class="media-row" @wheel="scrollTabs">
-          <VCard
-            v-for="item in favoriteItems"
-            :key="`favorite-${item.Id}`"
-            class="media-card media-card--row"
-            :class="{ 'media-card--active': selectedItem?.Id === item.Id }"
-            tag="button"
-            type="button"
-            variant="flat"
-            @click="emit('selectItem', item)"
-          >
-            <span class="media-card__poster">
-              <img
-                v-if="getImageUrl(item)"
-                :src="getImageUrl(item, 360)"
-                :alt="item.Name"
-                loading="lazy"
-              />
-              <Tv v-else-if="isTvItem(item)" :size="34" />
-              <Film v-else :size="34" />
-              <span v-if="isPlayed(item)" class="media-card__played" title="已观看">
-                <Check :size="13" />
-              </span>
-              <span v-else-if="hasPlaybackProgress(item)" class="media-card__progress">
-                <i :style="{ width: `${progressPercent(item)}%` }"></i>
-              </span>
-            </span>
-            <span class="media-card__body">
-              <span class="media-card__name">{{ item.Name }}</span>
-              <span class="media-card__meta">{{ formatMeta(item) }}</span>
-            </span>
-          </VCard>
-        </div>
-      </section>
+      <MediaRowSection
+        v-if="resumeItems.length"
+        title="继续观看"
+        :count-label="`${resumeItems.length} 项`"
+        :items="resumeItems"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        @select-item="emit('selectItem', $event)"
+      />
 
-      <section v-if="resumeItems.length" class="media-row-section">
-        <div class="shelf-heading">
-          <div>
-            <h3 class="shelf-heading__title">继续观看</h3>
-          </div>
-          <span>{{ resumeItems.length }} 项</span>
-        </div>
+      <MediaRowSection
+        v-if="nextUpItems.length"
+        title="下一集"
+        :count-label="`${nextUpItems.length} 集`"
+        :items="nextUpItems"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        @select-item="emit('selectItem', $event)"
+      />
 
-        <div class="media-row" @wheel="scrollTabs">
-          <VCard
-            v-for="item in resumeItems"
-            :key="`resume-${item.Id}`"
-            class="media-card media-card--row"
-            :class="{ 'media-card--active': selectedItem?.Id === item.Id }"
-            tag="button"
-            type="button"
-            variant="flat"
-            @click="emit('selectItem', item)"
-          >
-            <span class="media-card__poster">
-              <img
-                v-if="getImageUrl(item)"
-                :src="getImageUrl(item, 360)"
-                :alt="item.Name"
-                loading="lazy"
-              />
-              <Tv v-else-if="isTvItem(item)" :size="34" />
-              <Film v-else :size="34" />
-              <span v-if="isPlayed(item)" class="media-card__played" title="已观看">
-                <Check :size="13" />
-              </span>
-              <span v-else-if="hasPlaybackProgress(item)" class="media-card__progress">
-                <i :style="{ width: `${progressPercent(item)}%` }"></i>
-              </span>
-            </span>
-            <span class="media-card__body">
-              <span class="media-card__name">{{ item.Name }}</span>
-              <span class="media-card__meta">{{ formatMeta(item) }}</span>
-            </span>
-          </VCard>
-        </div>
-      </section>
+      <MediaRowSection
+        v-if="playedItems.length"
+        title="最近播放"
+        :count-label="`${playedItems.length} 项`"
+        :items="playedItems"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        @select-item="emit('selectItem', $event)"
+      />
 
-      <section v-if="latestItems.length" class="media-row-section">
-        <div class="shelf-heading">
-          <div>
-            <h3 class="shelf-heading__title">最近添加</h3>
-          </div>
-          <span>{{ latestItems.length }} 项</span>
-        </div>
+      <MediaRowSection
+        v-if="latestItems.length"
+        title="最近添加"
+        :count-label="`${latestItems.length} 项`"
+        :items="latestItems"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        @select-item="emit('selectItem', $event)"
+      />
 
-        <div class="media-row" @wheel="scrollTabs">
-          <VCard
-            v-for="item in latestItems"
-            :key="`latest-${item.Id}`"
-            class="media-card media-card--row"
-            :class="{ 'media-card--active': selectedItem?.Id === item.Id }"
-            tag="button"
-            type="button"
-            variant="flat"
-            @click="emit('selectItem', item)"
-          >
-            <span class="media-card__poster">
-              <img
-                v-if="getImageUrl(item)"
-                :src="getImageUrl(item, 360)"
-                :alt="item.Name"
-                loading="lazy"
-              />
-              <Tv v-else-if="isTvItem(item)" :size="34" />
-              <Film v-else :size="34" />
-              <span v-if="isPlayed(item)" class="media-card__played" title="已观看">
-                <Check :size="13" />
-              </span>
-              <span v-else-if="hasPlaybackProgress(item)" class="media-card__progress">
-                <i :style="{ width: `${progressPercent(item)}%` }"></i>
-              </span>
-            </span>
-            <span class="media-card__body">
-              <span class="media-card__name">{{ item.Name }}</span>
-              <span class="media-card__meta">{{ formatMeta(item) }}</span>
-            </span>
-          </VCard>
-        </div>
-      </section>
+      <MediaRowSection
+        v-if="liveTvChannels.length"
+        title="电视直播"
+        :count-label="`${liveTvChannels.length} 个频道`"
+        :items="liveTvChannels"
+        :selected-item-id="selectedItem?.Id"
+        :get-image-url="getImageUrl"
+        :get-meta="formatMeta"
+        show-live-badge
+        :show-status="false"
+        @select-item="emit('selectItem', $event)"
+      />
 
       <VSheet v-if="!hasHomeRows" class="empty-state">
         <Film :size="28" />
@@ -432,105 +664,157 @@ function isPlayed(item: EmbyItem) {
       </VSheet>
     </div>
 
-    <VSheet v-else-if="!items.length" class="empty-state">
-      <Film :size="28" />
-      <span>{{ isBusy ? '正在读取媒体条目' : '选择一个媒体库开始浏览' }}</span>
-      <span v-if="isBusy" class="loading-dots" aria-hidden="true">
-        <i></i>
-        <i></i>
-        <i></i>
-      </span>
-    </VSheet>
+    <PlaybackHistoryView
+      v-else-if="isPlaybackHistoryView"
+      :resume-items="resumeHistoryItems"
+      :resume-items-total-count="resumeItemsTotalCount"
+      :resume-items-can-load-more="resumeItemsCanLoadMore"
+      :played-items="playedHistoryItems"
+      :played-items-total-count="playedItemsTotalCount"
+      :played-items-can-load-more="playedItemsCanLoadMore"
+      :selected-item="selectedItem"
+      :is-busy="isBusy"
+      :get-image-url="getImageUrl"
+      @clear-playback-progress="emit('clearPlaybackProgress', $event)"
+      @load-more-played="emit('loadMorePlayed')"
+      @load-more-resume="emit('loadMoreResume')"
+      @select-item="emit('selectItem', $event)"
+    />
 
-    <div v-else class="shelf-heading">
-      <div>
-        <h3 class="shelf-heading__title">当前媒体库</h3>
+    <section v-else-if="isLiveTvView" class="search-results-section">
+      <div class="shelf-heading">
+        <div>
+          <h3 class="shelf-heading__title">电视直播</h3>
+        </div>
+        <span>{{ liveTvChannels.length }} 个频道</span>
       </div>
-      <span>{{ filteredItems.length }} / {{ itemsTotalCount || filteredItems.length }} 项</span>
-    </div>
 
-    <div v-if="hasSelectedLibrary && !isSearching" class="library-controls">
-      <VSelect
-        v-model="libraryFilter"
-        class="library-controls__select"
-        :items="filterOptions"
-        item-title="label"
-        item-value="value"
-        label="筛选"
-        density="compact"
-        variant="solo-filled"
-        hide-details
-      />
-      <VSelect
-        class="library-controls__select"
-        :model-value="librarySortBy"
-        :items="sortOptions"
-        item-title="label"
-        item-value="value"
-        label="排序"
-        density="compact"
-        variant="solo-filled"
-        hide-details
-        @update:model-value="changeSortBy"
-      />
-      <VSelect
-        class="library-controls__select"
-        :model-value="librarySortOrder"
-        :items="orderOptions"
-        item-title="label"
-        item-value="value"
-        label="方向"
-        density="compact"
-        variant="solo-filled"
-        hide-details
-        @update:model-value="changeSortOrder"
-      />
-    </div>
+      <VSheet v-if="!liveTvChannels.length" class="empty-state">
+        <RadioTower :size="28" />
+        <span>{{ isBusy ? '正在读取直播频道' : '没有可用直播频道' }}</span>
+      </VSheet>
 
-    <VSheet v-if="items.length && !filteredItems.length" class="empty-state empty-state--compact">
-      <Film :size="28" />
-      <span>当前已加载条目中没有匹配“{{ activeFilterLabel }}”的内容</span>
-    </VSheet>
+      <template v-else>
+        <LiveTvGuideTimeline
+          :channels="liveTvChannels"
+          :programs-by-channel="liveTvProgramsByChannel"
+          :selected-channel-id="selectedItem?.Id"
+          @select-channel="emit('selectItem', $event)"
+        />
 
-    <div v-if="items.length" class="media-grid">
-      <VCard
-        v-for="item in filteredItems"
-        :key="item.Id"
-        class="media-card"
-        :class="{ 'media-card--active': selectedItem?.Id === item.Id }"
-        tag="button"
-        type="button"
-        variant="flat"
-        @click="emit('selectItem', item)"
-      >
-        <span class="media-card__poster">
-          <img
-            v-if="getImageUrl(item)"
-            :src="getImageUrl(item, 360)"
-            :alt="item.Name"
-            loading="lazy"
+        <div class="media-grid media-grid--channels">
+          <LibraryMediaCard
+            v-for="item in liveTvChannels"
+            :key="`live-tv-grid-${item.Id}`"
+            :item="item"
+            :selected="selectedItem?.Id === item.Id"
+            :meta="formatMeta(item)"
+            :get-image-url="getImageUrl"
+            :current-program-name="liveTvChannelMeta(item).currentProgramName"
+            :program-rows="liveTvChannelMeta(item).programRows"
+            poster-variant="channel"
+            show-live-badge
+            :show-status="false"
+            @select-item="emit('selectItem', $event)"
           />
-          <Tv v-else-if="isTvItem(item)" :size="34" />
-          <Film v-else :size="34" />
-          <span v-if="isPlayed(item)" class="media-card__played" title="已观看">
-            <Check :size="13" />
-          </span>
-          <span v-else-if="hasPlaybackProgress(item)" class="media-card__progress">
-            <i :style="{ width: `${progressPercent(item)}%` }"></i>
-          </span>
-        </span>
-        <span class="media-card__body">
-          <span class="media-card__name">{{ item.Name }}</span>
-          <span class="media-card__meta">{{ formatMeta(item) }}</span>
-        </span>
-      </VCard>
-    </div>
+        </div>
+      </template>
+    </section>
 
-    <div v-if="canLoadMore && !isSearching" class="load-more-row">
-      <VBtn :loading="isBusy" variant="tonal" type="button" @click="emit('loadMore')">
-        加载更多
-      </VBtn>
-    </div>
+    <template v-else-if="hasSelectedLibrary">
+      <VSheet v-if="!items.length" class="empty-state">
+        <Film :size="28" />
+        <span>{{ isBusy ? '正在读取媒体条目' : '这个媒体库没有可显示条目' }}</span>
+        <span v-if="isBusy" class="loading-dots" aria-hidden="true">
+          <i></i>
+          <i></i>
+          <i></i>
+        </span>
+      </VSheet>
+
+      <template v-else>
+        <div class="shelf-heading">
+          <div>
+            <h3 class="shelf-heading__title">当前媒体库</h3>
+          </div>
+          <span>{{ libraryCountLabel }}</span>
+        </div>
+
+        <div class="library-filter-bar flex flex-wrap items-center justify-start gap-2.5 min-w-0">
+          <div class="library-controls flex flex-wrap items-center justify-start gap-2.5 min-w-0">
+            <VSelect
+              v-model="libraryFilter"
+              class="library-controls__select flex-1 basis-[150px] max-w-[180px] min-w-[140px]"
+              :items="filterOptions"
+              item-title="label"
+              item-value="value"
+              label="筛选"
+              density="compact"
+              variant="solo-filled"
+              hide-details
+            />
+            <VSelect
+              class="library-controls__select flex-1 basis-[150px] max-w-[180px] min-w-[140px]"
+              :model-value="librarySortBy"
+              :items="sortOptions"
+              item-title="label"
+              item-value="value"
+              label="排序"
+              density="compact"
+              variant="solo-filled"
+              hide-details
+              @update:model-value="changeSortBy"
+            />
+            <VSelect
+              class="library-controls__select flex-1 basis-[150px] max-w-[180px] min-w-[140px]"
+              :model-value="librarySortOrder"
+              :items="orderOptions"
+              item-title="label"
+              item-value="value"
+              label="方向"
+              density="compact"
+              variant="solo-filled"
+              hide-details
+              @update:model-value="changeSortOrder"
+            />
+          </div>
+
+          <LibraryAdvancedFilters
+            class="library-filter-bar__advanced flex-1 basis-[520px]"
+            :filters="advancedFilters"
+            :type-options="advancedFilterOptions.types"
+            :year-options="advancedFilterOptions.years"
+            :genre-options="advancedFilterOptions.genres"
+            :has-active-filters="hasActiveAdvancedFilters"
+            @update-filters="updateAdvancedFilters"
+            @reset="advancedFilters = createDefaultLibraryAdvancedFilters()"
+          />
+        </div>
+
+        <VSheet v-if="!filteredItems.length" class="empty-state empty-state--compact">
+          <Film :size="28" />
+          <span>当前已加载条目中没有匹配“{{ activeFilterLabel }}”的内容</span>
+        </VSheet>
+
+        <div v-else class="media-grid">
+          <LibraryMediaCard
+            v-for="item in filteredItems"
+            :key="item.Id"
+            :item="item"
+            :selected="selectedItem?.Id === item.Id"
+            :meta="formatMeta(item)"
+            :get-image-url="getImageUrl"
+            @select-item="emit('selectItem', $event)"
+          />
+        </div>
+
+        <div v-if="canLoadMore" class="load-more-row">
+          <VBtn :loading="isBusy" variant="tonal" type="button" @click="emit('loadMore')">
+            加载更多
+          </VBtn>
+        </div>
+      </template>
+    </template>
   </section>
 </template>
 
@@ -538,10 +822,9 @@ function isPlayed(item: EmbyItem) {
 .library-browser {
   display: grid;
   align-content: start;
-  gap: 14px;
+  gap: 18px;
   min-width: 0;
   min-height: 0;
-  animation: surface-enter var(--motion-emphasized) both;
 }
 
 .library-browser__chrome {
@@ -550,7 +833,7 @@ function isPlayed(item: EmbyItem) {
   justify-content: space-between;
   gap: 18px;
   min-width: 0;
-  padding: 0;
+  padding: 2px 0 4px;
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -565,26 +848,19 @@ function isPlayed(item: EmbyItem) {
 
 .shelf-heading__title {
   margin: 0;
-  color: var(--color-text);
-  font-size: 1rem;
-  font-weight: 650;
+  font-size: clamp(1.1rem, 1.6vw, 1.46rem);
+  font-weight: 500;
   line-height: 1.25;
 }
 
 .shelf-heading span {
-  color: var(--color-muted);
-  font-size: 0.82rem;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+  font-size: 0.84rem;
 }
 
 .home-sections {
   display: grid;
-  gap: 24px;
-  min-width: 0;
-}
-
-.media-row-section {
-  display: grid;
-  gap: 12px;
+  gap: 30px;
   min-width: 0;
 }
 
@@ -598,21 +874,23 @@ function isPlayed(item: EmbyItem) {
   width: min(360px, 100%);
 }
 
-.library-controls {
-  display: flex;
-  justify-content: end;
-  gap: 10px;
-  min-width: 0;
+.library-browser__search :deep(.v-field) {
+  background: rgb(var(--v-theme-surface));
 }
 
-.library-controls__select {
-  max-width: 190px;
+.library-browser__search :deep(.v-field__prepend-inner) {
+  align-items: center;
+  padding-top: 0;
+}
+
+.library-controls :deep(.v-field) {
+  background: rgb(var(--v-theme-surface));
 }
 
 .library-tabs-shell {
+  position: relative;
   min-width: 0;
   overflow: hidden;
-  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 30px), transparent 100%);
 }
 
 .library-tabs {
@@ -621,7 +899,7 @@ function isPlayed(item: EmbyItem) {
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 2px 0 10px;
+  padding: 2px 42px 10px;
   scrollbar-width: none;
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
@@ -633,16 +911,44 @@ function isPlayed(item: EmbyItem) {
 
 .library-tabs__button {
   flex: 0 0 auto;
-  gap: 8px;
   height: 36px;
-  border-radius: 8px;
+  padding: 0 12px;
   cursor: pointer;
+}
+
+.library-tabs__button :deep(.v-chip__content) {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  line-height: 1;
+}
+
+.library-tabs-arrow {
+  position: absolute;
+  top: 18px;
+  z-index: 4;
+  width: 34px;
+  height: 34px;
+  transform: translateY(-50%);
+}
+
+.library-tabs-arrow--previous {
+  left: 0;
+}
+
+.library-tabs-arrow--next {
+  right: 0;
 }
 
 .media-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(clamp(132px, 13vw, 172px), 1fr));
-  gap: 18px 14px;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(138px, 13vw, 184px), 1fr));
+  gap: 20px 16px;
+}
+
+.media-grid--channels {
+  grid-template-columns: repeat(auto-fill, minmax(clamp(170px, 16vw, 220px), 1fr));
 }
 
 .load-more-row {
@@ -651,141 +957,9 @@ function isPlayed(item: EmbyItem) {
   padding: 4px 0 12px;
 }
 
-.media-row {
-  display: grid;
-  grid-auto-columns: clamp(136px, 14vw, 176px);
-  grid-auto-flow: column;
-  gap: 14px;
-  min-width: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding: 2px 0 12px;
-  scrollbar-width: none;
-  overscroll-behavior-x: contain;
-  -webkit-overflow-scrolling: touch;
-}
-
-.media-row::-webkit-scrollbar {
-  display: none;
-}
-
-.media-card {
-  display: grid;
-  gap: 10px;
-  min-width: 0;
-  padding: 8px;
-  color: inherit;
-  text-align: left;
-  background: color-mix(in srgb, var(--color-panel) 72%, transparent);
-  border: 1px solid rgb(255 255 255 / 6%);
-  border-radius: 8px;
-  cursor: pointer;
-  transition:
-    opacity var(--motion-fast),
-    transform var(--motion-fast);
-}
-
-.media-card:hover {
-  transform: translateY(-3px);
-}
-
-.media-card :deep(.v-card__overlay) {
-  border-radius: 8px;
-}
-
-.media-card__poster {
-  position: relative;
-  display: grid;
-  aspect-ratio: 2 / 3;
-  place-items: center;
-  overflow: hidden;
-  color: var(--color-muted);
-  background: linear-gradient(145deg, var(--color-panel-strong), #0d1219);
-  border: 1px solid rgb(255 255 255 / 8%);
-  border-radius: 6px;
-  box-shadow: none;
-  transition:
-    border-color var(--motion-fast),
-    box-shadow var(--motion-fast),
-    transform var(--motion-fast);
-}
-
-.media-card--row {
-  width: 100%;
-}
-
-.media-card__progress {
-  position: absolute;
-  right: 8px;
-  bottom: 8px;
-  left: 8px;
-  height: 4px;
-  overflow: hidden;
-  background: rgb(255 255 255 / 24%);
-  border-radius: 999px;
-}
-
-.media-card__progress i {
+.library-browser svg {
   display: block;
-  height: 100%;
-  background: var(--color-signal);
-  border-radius: inherit;
-}
-
-.media-card__played {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  display: inline-grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  color: #061015;
-  background: var(--color-signal);
-  border: 1px solid rgb(255 255 255 / 42%);
-  border-radius: 999px;
-  box-shadow: 0 8px 20px rgb(0 0 0 / 28%);
-}
-
-.media-card__poster img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.media-card__body {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-  padding: 0 2px 4px;
-}
-
-.media-card__name {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--color-text);
-  font-size: 0.92rem;
-  font-weight: 600;
-  line-height: 1.28;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.media-card__meta {
-  overflow: hidden;
-  color: var(--color-muted);
-  font-size: 0.78rem;
-  line-height: 1.28;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.media-card--active .media-card__poster {
-  border-color: var(--color-signal);
-  box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--color-signal) 28%, transparent),
-    var(--elevation-3);
+  flex: 0 0 auto;
 }
 
 .empty-state {
@@ -794,10 +968,7 @@ function isPlayed(item: EmbyItem) {
   place-items: center;
   align-content: center;
   gap: 12px;
-  color: var(--color-muted);
-  background: color-mix(in srgb, var(--color-panel) 82%, transparent);
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 10px;
+  color: rgba(var(--v-theme-on-surface), 0.68);
 }
 
 .empty-state--compact {
@@ -812,7 +983,7 @@ function isPlayed(item: EmbyItem) {
 .loading-dots i {
   width: 6px;
   height: 6px;
-  background: var(--color-signal);
+  background: rgb(var(--v-theme-primary));
   border-radius: 50%;
   animation: dot-pulse 900ms infinite ease-in-out;
 }
@@ -857,13 +1028,19 @@ function isPlayed(item: EmbyItem) {
     max-width: none;
   }
 
+  .library-tabs-arrow {
+    display: none;
+  }
+
+  .library-tabs {
+    padding-right: 0;
+    padding-left: 0;
+  }
+
   .media-grid {
     grid-template-columns: repeat(auto-fill, minmax(126px, 1fr));
     gap: 16px 12px;
   }
 
-  .media-card__name {
-    font-size: 0.84rem;
-  }
 }
 </style>

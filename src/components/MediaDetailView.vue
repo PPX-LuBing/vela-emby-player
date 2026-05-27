@@ -1,12 +1,25 @@
 <script setup lang="ts">
 import { computed, shallowRef, useTemplateRef, watch } from 'vue'
-import { ArrowLeft, Check, ChevronLeft, ChevronRight, Film, Heart, Play, Star, Tv, Video } from 'lucide-vue-next'
+import { ArrowLeft, Check, ChevronLeft, ChevronRight, Film, Heart, ListPlus, ListVideo, Music2, Play, RadioTower, Star, Tv, Video } from 'lucide-vue-next'
 import type { EmbyItem } from '../composables/useEmbyClient'
+import {
+  formatPlaybackTime,
+  formatRuntimeMinutes,
+  getResumePositionSeconds,
+  getResumePositionTicks,
+  isItemCollection as isCollectionItem,
+  isLiveTvItem as isLiveTvMediaItem,
+  isMusicItem as isMusicMediaItem,
+} from '../composables/mediaItemDisplay'
+import MediaCredits from './MediaCredits.vue'
+import MediaTechnicalInfo from './MediaTechnicalInfo.vue'
+import RelatedMediaRail from './RelatedMediaRail.vue'
 
 const props = defineProps<{
   item: Readonly<EmbyItem | null>
   seasons: readonly EmbyItem[]
   episodes: readonly EmbyItem[]
+  similarItems: readonly EmbyItem[]
   isBusy: boolean
   getImageUrl: (item: EmbyItem, width?: number) => string
   getBackdropUrl: (item: EmbyItem, width?: number) => string
@@ -16,7 +29,10 @@ const emit = defineEmits<{
   back: []
   changeFavorite: [payload: { item: EmbyItem; isFavorite: boolean }]
   changePlayed: [payload: { item: EmbyItem; isPlayed: boolean }]
+  addToQueue: [item?: EmbyItem]
   play: [item?: EmbyItem]
+  selectItem: [item: EmbyItem]
+  searchPerson: [name: string]
 }>()
 
 const activeSeasonKey = shallowRef('')
@@ -75,19 +91,27 @@ const activeSeasonGroup = computed(() => {
 
 const activeSeasonEpisodes = computed(() => activeSeasonGroup.value?.episodes ?? [])
 
-const visibleSeasonEpisodes = computed(() => {
-  if (!showUnplayedOnly.value) {
-    return activeSeasonEpisodes.value
-  }
-
-  return activeSeasonEpisodes.value.filter((episode) => !episode.UserData?.Played)
+const nextEpisode = computed(() => {
+  return allDetailItems.value
+    .filter((episode) => !episode.UserData?.Played)
+    .find(Boolean) ?? null
 })
 
-const nextEpisode = computed(() => {
-  return props.episodes
-    .filter((episode) => !episode.UserData?.Played)
-    .sort(compareEpisodesBySeason)
-    .find(Boolean) ?? null
+const resumeEpisode = computed(() => {
+  return allDetailItems.value
+    .find((episode) => getResumePositionTicks(episode) > 0) ?? null
+})
+
+const resumeItem = computed(() => {
+  if (!props.item) {
+    return null
+  }
+
+  if (props.item.Type === 'Series' || isMusicItem.value) {
+    return resumeEpisode.value
+  }
+
+  return getResumePositionTicks(props.item) > 0 ? props.item : null
 })
 
 const playableItem = computed(() => {
@@ -96,22 +120,198 @@ const playableItem = computed(() => {
   }
 
   if (props.item.Type === 'Series') {
-    return nextEpisode.value ?? visibleSeasonEpisodes.value[0] ?? activeSeasonEpisodes.value[0] ?? props.episodes[0] ?? null
+    return resumeItem.value ?? nextEpisode.value ?? visibleDetailItems.value[0] ?? activeSeasonEpisodes.value[0] ?? allDetailItems.value[0] ?? null
+  }
+
+  if ((isMusicItem.value && props.item.Type !== 'Audio') || isItemCollection.value) {
+    return resumeItem.value ?? nextEpisode.value ?? visibleDetailItems.value[0] ?? allDetailItems.value[0] ?? null
   }
 
   return props.item
 })
 
-const itemKind = computed(() => {
-  if (props.item?.Type === 'Series') {
-    return 'Series'
+const primaryPlayLabel = computed(() => {
+  if (!props.item) {
+    return '播放'
   }
 
-  return props.item?.Type === 'Episode' ? 'Episode' : 'Movie'
+  if (resumeItem.value) {
+    return '继续播放'
+  }
+
+  if (props.item.Type === 'Series') {
+    return nextEpisode.value ? '播放下一集' : '播放第一集'
+  }
+
+  if (props.item.Type === 'MusicArtist') {
+    return '播放艺术家'
+  }
+
+  if (props.item.Type === 'MusicAlbum') {
+    return '播放专辑'
+  }
+
+  if (props.item.Type === 'Playlist') {
+    return '播放列表'
+  }
+
+  if (props.item.Type === 'BoxSet') {
+    return '播放合集'
+  }
+
+  if (props.item.Type === 'Audio') {
+    return '播放曲目'
+  }
+
+  if (isLiveTvItem.value) {
+    return '观看直播'
+  }
+
+  return '播放'
+})
+
+const primaryPlayDescription = computed(() => {
+  if (!playableItem.value) {
+    return ''
+  }
+
+  if (resumeItem.value) {
+    return `从 ${formatPlayableItem(resumeItem.value)} · ${formatPlaybackTime(getResumePositionSeconds(resumeItem.value))} 继续`
+  }
+
+  if (props.item?.Type === 'Series' || isMusicItem.value || isItemCollection.value) {
+    return formatPlayableItem(playableItem.value)
+  }
+
+  return ''
+})
+
+const secondaryNextLabel = computed(() => {
+  if (!resumeItem.value || !nextEpisode.value || nextEpisode.value.Id === resumeItem.value.Id) {
+    return ''
+  }
+
+  if (props.item?.Type === 'Series' && !isMusicItem.value) {
+    return '播放下一集'
+  }
+
+  if (isMusicItem.value) {
+    return '播放下一首'
+  }
+
+  return ''
+})
+
+const itemKind = computed(() => {
+  if (props.item?.Type === 'Series') {
+    return '剧集'
+  }
+
+  if (props.item?.Type === 'Episode') {
+    return '分集'
+  }
+
+  if (props.item?.Type === 'MusicAlbum') {
+    return '专辑'
+  }
+
+  if (props.item?.Type === 'MusicArtist') {
+    return '艺术家'
+  }
+
+  if (props.item?.Type === 'Audio') {
+    return '曲目'
+  }
+
+  if (props.item?.Type === 'Playlist') {
+    return '播放列表'
+  }
+
+  if (props.item?.Type === 'BoxSet') {
+    return '合集'
+  }
+
+  if (props.item?.Type === 'TvChannel' || props.item?.Type === 'Channel') {
+    return '电视直播'
+  }
+
+  return '电影'
 })
 
 const isFavorite = computed(() => Boolean(props.item?.UserData?.IsFavorite))
 const isPlayed = computed(() => Boolean(props.item?.UserData?.Played))
+const isMusicItem = computed(() => props.item ? isMusicMediaItem(props.item) : false)
+const isLiveTvItem = computed(() => props.item ? isLiveTvMediaItem(props.item) : false)
+const isItemCollection = computed(() => props.item ? isCollectionItem(props.item) : false)
+const isDetailCollection = computed(() => props.item?.Type === 'Series' || isMusicItem.value || isItemCollection.value)
+const backdropUrl = computed(() => props.item ? props.getBackdropUrl(props.item, 1800) : '')
+const posterUrl = computed(() => props.item ? props.getImageUrl(props.item, 520) : '')
+const heroStyle = computed(() => ({
+  backgroundImage: backdropUrl.value ? `url(${backdropUrl.value})` : undefined,
+}))
+
+const allDetailItems = computed(() => [...props.episodes].sort(compareEpisodesBySeason))
+
+const visibleDetailItems = computed(() => {
+  const sourceItems = props.item?.Type === 'Series'
+    ? activeSeasonEpisodes.value
+    : allDetailItems.value
+
+  if (!showUnplayedOnly.value) {
+    return sourceItems
+  }
+
+  return sourceItems.filter((item) => !item.UserData?.Played)
+})
+const visibleDetailCards = computed(() => visibleDetailItems.value.map((detailItem) => ({
+  item: detailItem,
+  imageUrl: props.getImageUrl(detailItem, 240),
+  indexLabel: formatDetailItemIndex(detailItem),
+  metaLabel: formatRuntime(detailItem) || formatEpisode(detailItem),
+})))
+
+const collectionTitle = computed(() => {
+  if (props.item?.Type === 'Series') {
+    return '分季与分集'
+  }
+
+  if (props.item?.Type === 'Playlist') {
+    return '播放列表条目'
+  }
+
+  if (props.item?.Type === 'BoxSet') {
+    return '合集条目'
+  }
+
+  if (props.item?.Type === 'MusicAlbum') {
+    return '专辑曲目'
+  }
+
+  if (props.item?.Type === 'MusicArtist') {
+    return '艺术家曲目'
+  }
+
+  if (props.item?.Type === 'Audio') {
+    return '相关曲目'
+  }
+
+  return '相关条目'
+})
+
+const collectionCountLabel = computed(() => {
+  const count = visibleDetailItems.value.length
+  if (isMusicItem.value) {
+    return `${count} 首`
+  }
+
+  if (isItemCollection.value) {
+    return `${count} 项`
+  }
+
+  return `${count} 集`
+})
+
+const unplayedFilterLabel = computed(() => (isMusicItem.value ? '仅看未播放' : '仅看未看'))
 
 watch(
   seasonGroups,
@@ -129,10 +329,23 @@ watch(
 )
 
 function formatRuntime(item: EmbyItem) {
-  return item.RunTimeTicks ? `${Math.round(item.RunTimeTicks / 600_000_000)} 分钟` : ''
+  return formatRuntimeMinutes(item.RunTimeTicks)
 }
 
 function formatEpisode(item: EmbyItem) {
+  if (isLiveTvMediaItem(item)) {
+    return [
+      item.ChannelNumber || item.Number ? `频道 ${item.ChannelNumber || item.Number}` : '',
+      item.CurrentProgram?.Name,
+    ].filter(Boolean).join(' · ')
+  }
+
+  if (isMusicMediaItem(item)) {
+    const artist = item.AlbumArtist || item.AlbumArtists?.[0] || item.Artists?.[0] || item.Album || ''
+    const track = formatAudioTrackNumber(item)
+    return [artist, track].filter(Boolean).join(' · ')
+  }
+
   if (item.Type !== 'Episode' && item.Type !== 'Series') {
     return ''
   }
@@ -143,7 +356,23 @@ function formatEpisode(item: EmbyItem) {
 }
 
 function formatSeriesCount(item: EmbyItem) {
+  if (isLiveTvMediaItem(item)) {
+    return '直播'
+  }
+
   const count = item.RecursiveItemCount ?? item.ChildCount ?? item.UserData?.UnplayedItemCount
+  if (item.Type === 'MusicArtist') {
+    return count ? `${count} 项` : ''
+  }
+
+  if (item.Type === 'MusicAlbum') {
+    return count ? `${count} 首` : ''
+  }
+
+  if (isCollectionItem(item)) {
+    return count ? `${count} 项` : ''
+  }
+
   return count ? `${count} 集` : ''
 }
 
@@ -166,9 +395,99 @@ function formatSeasonMeta(group: { episodes: EmbyItem[] }) {
 }
 
 function formatNextEpisode(item: EmbyItem) {
+  if (item.Type === 'Audio') {
+    const album = item.Album || item.AlbumArtist || item.AlbumArtists?.[0] || ''
+    const track = formatAudioTrackNumber(item)
+    return [album, track, getEpisodeDisplayName(item)].filter(Boolean).join(' · ')
+  }
+
   const season = item.ParentIndexNumber ? `第 ${item.ParentIndexNumber} 季` : ''
   const episode = item.IndexNumber ? `第 ${item.IndexNumber} 集` : ''
-  return [season, episode, item.Name].filter(Boolean).join(' · ')
+  return [season, episode, getEpisodeDisplayName(item)].filter(Boolean).join(' · ')
+}
+
+function formatDetailItemIndex(item: EmbyItem) {
+  if (item.Type === 'Audio') {
+    return item.IndexNumber ? `第 ${item.IndexNumber} 首` : 'Track'
+  }
+
+  if (item.Type === 'Episode') {
+    return item.IndexNumber ? `第 ${item.IndexNumber} 集` : 'Episode'
+  }
+
+  if (item.Type === 'Movie') {
+    return 'Movie'
+  }
+
+  if (item.Type === 'MusicVideo') {
+    return 'Music Video'
+  }
+
+  return item.Type
+}
+
+function formatDetailCollectionEmptyState() {
+  if (props.isBusy) {
+    if (isMusicItem.value) {
+      return '正在读取曲目'
+    }
+
+    if (isItemCollection.value) {
+      return '正在读取条目'
+    }
+
+    return '正在读取分集'
+  }
+
+  if (isMusicItem.value) {
+    return '没有读取到曲目'
+  }
+
+  if (isItemCollection.value) {
+    return '没有读取到条目'
+  }
+
+  return '没有读取到分集'
+}
+
+function formatPlayableItem(item: EmbyItem) {
+  if (item.Type === 'Episode' || item.Type === 'Audio') {
+    return formatNextEpisode(item)
+  }
+
+  return item.Name
+}
+
+function getEpisodeDisplayName(item: EmbyItem) {
+  if ((item.Type !== 'Episode' && item.Type !== 'Audio') || !item.IndexNumber) {
+    return item.Name
+  }
+
+  const normalizedName = normalizeEpisodeTitle(item.Name)
+  const normalizedIndexTitle = normalizeEpisodeTitle(`第 ${item.IndexNumber} 集`)
+  const normalizedEpisodeTitle = normalizeEpisodeTitle(`Episode ${item.IndexNumber}`)
+  const normalizedTrackTitle = normalizeEpisodeTitle(`Track ${item.IndexNumber}`)
+  const normalizedSongTitle = normalizeEpisodeTitle(`第 ${item.IndexNumber} 首`)
+  if (
+    normalizedName === normalizedIndexTitle ||
+    normalizedName === normalizedEpisodeTitle ||
+    normalizedName === normalizedTrackTitle ||
+    normalizedName === normalizedSongTitle
+  ) {
+    return ''
+  }
+
+  return item.Name
+}
+
+function formatAudioTrackNumber(item: EmbyItem) {
+  const disc = item.ParentIndexNumber ? `D${String(item.ParentIndexNumber).padStart(2, '0')}` : ''
+  const track = item.IndexNumber ? `T${String(item.IndexNumber).padStart(2, '0')}` : ''
+  return [disc, track].filter(Boolean).join('')
+}
+
+function normalizeEpisodeTitle(value: string) {
+  return value.replace(/\s+/g, '').toLowerCase()
 }
 
 function getSeasonKey(season: EmbyItem) {
@@ -195,13 +514,18 @@ function createFallbackSeason(episode: EmbyItem): EmbyItem {
 }
 
 function compareSeasons(first: EmbyItem, second: EmbyItem) {
-  const firstSeason = getSeasonNumber(first)
-  const secondSeason = getSeasonNumber(second)
+  const firstSeason = getSeasonSortNumber(first)
+  const secondSeason = getSeasonSortNumber(second)
   if (firstSeason !== secondSeason) {
     return firstSeason - secondSeason
   }
 
   return first.Name.localeCompare(second.Name)
+}
+
+function getSeasonSortNumber(season: EmbyItem) {
+  const seasonNumber = getSeasonNumber(season)
+  return seasonNumber === 0 ? Number.MAX_SAFE_INTEGER : seasonNumber
 }
 
 function compareEpisodes(first: EmbyItem, second: EmbyItem) {
@@ -230,6 +554,10 @@ function playSelected() {
   }
 }
 
+function addSelectedToQueue() {
+  emit('addToQueue', playableItem.value ?? props.item ?? undefined)
+}
+
 function playNextEpisode() {
   if (nextEpisode.value) {
     emit('play', nextEpisode.value)
@@ -250,12 +578,30 @@ function togglePlayed() {
 
 function scrollHorizontal(event: WheelEvent) {
   const target = event.currentTarget
-  if (!(target instanceof HTMLElement) || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+  if (!(target instanceof HTMLElement)) {
+    return
+  }
+
+  const horizontalDelta = Math.abs(event.deltaX)
+  const verticalDelta = Math.abs(event.deltaY)
+  const shouldScrollHorizontally = horizontalDelta > verticalDelta || event.shiftKey
+  if (!shouldScrollHorizontally) {
+    return
+  }
+
+  const delta = event.shiftKey && verticalDelta > horizontalDelta ? event.deltaY : event.deltaX
+  if (delta === 0 || target.scrollWidth <= target.clientWidth) {
+    return
+  }
+
+  const maxScrollLeft = target.scrollWidth - target.clientWidth
+  const nextScrollLeft = Math.min(maxScrollLeft, Math.max(0, target.scrollLeft + delta))
+  if (nextScrollLeft === target.scrollLeft) {
     return
   }
 
   event.preventDefault()
-  target.scrollLeft += event.deltaY
+  target.scrollLeft = nextScrollLeft
 }
 
 function scrollEpisodeRail(direction: 'previous' | 'next') {
@@ -281,6 +627,7 @@ function startEpisodeDrag(event: PointerEvent) {
   hasDraggedEpisodes.value = false
   dragStartX.value = event.clientX
   dragStartScrollLeft.value = rail.scrollLeft
+  rail.setPointerCapture?.(event.pointerId)
 }
 
 function moveEpisodeDrag(event: PointerEvent) {
@@ -310,6 +657,10 @@ function endEpisodeDrag(event: PointerEvent) {
     }, 0)
   }
 
+  if (rail.hasPointerCapture?.(event.pointerId)) {
+    rail.releasePointerCapture(event.pointerId)
+  }
+
   hasDraggedEpisodes.value = false
   isDraggingEpisodes.value = false
 }
@@ -325,14 +676,7 @@ function playEpisode(episode: EmbyItem) {
 
 <template>
   <section v-if="item" class="detail-view">
-    <div
-      class="detail-hero"
-      :style="{
-        backgroundImage: getBackdropUrl(item)
-          ? `linear-gradient(90deg, rgb(16 21 28 / 96%) 0%, rgb(16 21 28 / 88%) 62%, rgb(16 21 28 / 58%) 100%), url(${getBackdropUrl(item, 1800)})`
-          : 'linear-gradient(135deg, #111b28, #0a0e14)',
-      }"
-    >
+    <div class="detail-hero" :style="heroStyle">
       <VBtn class="detail-back" variant="tonal" type="button" @click="emit('back')">
         <template #prepend>
           <ArrowLeft :size="18" />
@@ -342,8 +686,11 @@ function playEpisode(episode: EmbyItem) {
 
       <div class="detail-hero__content">
         <div class="detail-poster">
-          <img v-if="getImageUrl(item)" :src="getImageUrl(item, 520)" :alt="item.Name" />
+          <img v-if="posterUrl" :src="posterUrl" :alt="item.Name" width="520" height="780" fetchpriority="high" />
           <Tv v-else-if="item.Type === 'Series'" :size="42" />
+          <ListVideo v-else-if="isItemCollection" :size="42" />
+          <Music2 v-else-if="isMusicItem" :size="42" />
+          <RadioTower v-else-if="isLiveTvItem" :size="42" />
           <Film v-else :size="42" />
         </div>
 
@@ -363,15 +710,30 @@ function playEpisode(episode: EmbyItem) {
             class="detail-play"
             color="primary"
             type="button"
-            :disabled="item.Type === 'Series' && !playableItem"
+            :disabled="isDetailCollection && !playableItem"
             @click="playSelected"
           >
             <template #prepend>
               <Play :size="19" />
             </template>
-            {{ item.Type === 'Series' ? '播放第一集' : '播放' }}
+            {{ primaryPlayLabel }}
           </VBtn>
-          <div class="detail-actions">
+          <VBtn
+            class="detail-play detail-play--secondary"
+            variant="tonal"
+            type="button"
+            :disabled="isDetailCollection && !playableItem"
+            @click="addSelectedToQueue"
+          >
+            <template #prepend>
+              <ListPlus :size="18" />
+            </template>
+            加入队列
+          </VBtn>
+          <p v-if="primaryPlayDescription" class="detail-resume">
+            {{ primaryPlayDescription }}
+          </p>
+          <div v-if="!isLiveTvItem" class="detail-actions">
             <VBtn
               :color="isFavorite ? 'primary' : undefined"
               :variant="isFavorite ? 'flat' : 'tonal'"
@@ -397,8 +759,11 @@ function playEpisode(episode: EmbyItem) {
               {{ isPlayed ? '标记未看' : '标记已看' }}
             </VBtn>
           </div>
+          <p v-if="isLiveTvItem && item.CurrentProgram?.Overview" class="detail-overview">
+            {{ item.CurrentProgram.Overview }}
+          </p>
           <VBtn
-            v-if="item.Type === 'Series' && nextEpisode"
+            v-if="secondaryNextLabel"
             class="detail-play detail-play--secondary"
             variant="tonal"
             type="button"
@@ -407,22 +772,22 @@ function playEpisode(episode: EmbyItem) {
             <template #prepend>
               <Play :size="18" />
             </template>
-            播放下一集
+            {{ secondaryNextLabel }}
           </VBtn>
-          <p v-if="item.Type === 'Series' && nextEpisode" class="detail-next">
+          <p v-if="secondaryNextLabel && nextEpisode" class="detail-next">
             {{ formatNextEpisode(nextEpisode) }}
           </p>
         </div>
       </div>
     </div>
 
-    <section v-if="item.Type === 'Series'" class="episode-section">
+    <section v-if="isDetailCollection" class="episode-section">
       <div class="episode-section__header">
         <div>
-          <p class="section-kicker">Seasons</p>
-          <h3 class="episode-section__title">分季与分集</h3>
+          <p class="section-kicker">{{ isMusicItem ? 'Tracks' : isItemCollection ? 'Items' : 'Seasons' }}</p>
+          <h3 class="episode-section__title">{{ collectionTitle }}</h3>
         </div>
-        <span>{{ isBusy ? '读取中' : `${episodes.length} 集` }}</span>
+        <span>{{ isBusy ? '读取中' : collectionCountLabel }}</span>
       </div>
 
       <div class="episode-filters">
@@ -435,11 +800,11 @@ function playEpisode(episode: EmbyItem) {
           <template #prepend>
             <Check :size="16" />
           </template>
-          仅看未看
+          {{ unplayedFilterLabel }}
         </VBtn>
       </div>
 
-      <div v-if="seasonGroups.length" class="season-tabs" aria-label="季列表">
+      <div v-if="item.Type === 'Series' && seasonGroups.length" class="season-tabs" aria-label="季列表">
         <VChip
           v-for="group in seasonGroups"
           :key="group.key"
@@ -456,13 +821,13 @@ function playEpisode(episode: EmbyItem) {
         </VChip>
       </div>
 
-      <div v-if="visibleSeasonEpisodes.length" class="episode-rail-shell">
+      <div v-if="visibleDetailItems.length" class="episode-rail-shell">
         <VBtn
           class="episode-rail-button episode-rail-button--previous"
           type="button"
           icon
           variant="tonal"
-          aria-label="上一组分集"
+          :aria-label="isMusicItem ? '上一组曲目' : '上一组分集'"
           @click="scrollEpisodeRail('previous')"
         >
           <ChevronLeft :size="22" />
@@ -472,7 +837,7 @@ function playEpisode(episode: EmbyItem) {
           ref="episodeRail"
           class="episode-rail"
           :class="{ 'episode-rail--dragging': isDraggingEpisodes }"
-          aria-label="当前季分集"
+          :aria-label="isMusicItem ? '当前专辑曲目' : isItemCollection ? '当前合集条目' : '当前季分集'"
           @wheel="scrollHorizontal"
           @pointerdown="startEpisodeDrag"
           @pointermove="moveEpisodeDrag"
@@ -480,34 +845,38 @@ function playEpisode(episode: EmbyItem) {
             @pointercancel="endEpisodeDrag"
         >
           <VCard
-            v-for="episode in visibleSeasonEpisodes"
-            :key="episode.Id"
+            v-for="card in visibleDetailCards"
+            :key="card.item.Id"
             class="episode-tile"
             tag="button"
             type="button"
             variant="flat"
-            :data-episode-id="episode.Id"
-            @click="playEpisode(episode)"
+            :data-episode-id="card.item.Id"
+            @click="playEpisode(card.item)"
           >
             <span class="episode-tile__poster">
               <img
-                v-if="getImageUrl(episode)"
-                :src="getImageUrl(episode, 240)"
-                :alt="episode.Name"
+                v-if="card.imageUrl"
+                :src="card.imageUrl"
+                :alt="card.item.Name"
+                width="240"
+                height="135"
                 loading="lazy"
               />
+              <Music2 v-else-if="card.item.Type === 'Audio'" :size="24" />
+              <Tv v-else-if="card.item.Type === 'Episode'" :size="24" />
               <Film v-else :size="24" />
               <span class="episode-tile__play"><Play :size="16" /></span>
-              <span v-if="episode.UserData?.Played" class="episode-tile__played">
+              <span v-if="card.item.UserData?.Played" class="episode-tile__played">
                 <Check :size="13" />
               </span>
             </span>
             <span class="episode-tile__body">
               <span class="episode-tile__index">
-                {{ episode.IndexNumber ? `第 ${episode.IndexNumber} 集` : 'Episode' }}
+                {{ card.indexLabel }}
               </span>
-              <span class="episode-tile__title">{{ episode.Name }}</span>
-              <span class="episode-tile__meta">{{ formatRuntime(episode) || formatEpisode(episode) }}</span>
+              <span class="episode-tile__title">{{ card.item.Name }}</span>
+              <span class="episode-tile__meta">{{ card.metaLabel }}</span>
             </span>
           </VCard>
         </div>
@@ -517,7 +886,7 @@ function playEpisode(episode: EmbyItem) {
           type="button"
           icon
           variant="tonal"
-          aria-label="下一组分集"
+          :aria-label="isMusicItem ? '下一组曲目' : '下一组分集'"
           @click="scrollEpisodeRail('next')"
         >
           <ChevronRight :size="22" />
@@ -525,10 +894,24 @@ function playEpisode(episode: EmbyItem) {
       </div>
 
       <VSheet v-else class="episode-empty">
-        <Tv :size="26" />
-        <span>{{ isBusy ? '正在读取分集' : '没有读取到分集' }}</span>
+        <Music2 v-if="isMusicItem" :size="26" />
+        <ListVideo v-else-if="isItemCollection" :size="26" />
+        <Tv v-else :size="26" />
+        <span>{{ formatDetailCollectionEmptyState() }}</span>
       </VSheet>
     </section>
+
+    <RelatedMediaRail
+      v-if="similarItems.length"
+      title="相似推荐"
+      :items="similarItems"
+      :get-image-url="getImageUrl"
+      @select-item="emit('selectItem', $event)"
+    />
+
+    <MediaCredits :item="item" @search-person="emit('searchPerson', $event)" />
+
+    <MediaTechnicalInfo :item="item" />
   </section>
 
   <section v-else class="detail-empty">
@@ -541,36 +924,37 @@ function playEpisode(episode: EmbyItem) {
 .detail-view {
   display: grid;
   align-content: start;
-  gap: 16px;
+  gap: 18px;
   min-height: 0;
-  animation: surface-enter var(--motion-emphasized) both;
 }
 
 .detail-hero {
+  position: relative;
   display: grid;
   align-content: start;
-  min-height: 0;
-  padding: 18px;
+  min-height: 380px;
+  overflow: hidden;
+  padding: 22px;
+  background-color: rgb(var(--v-theme-surface));
   background-position: center;
   background-size: cover;
-  border: 1px solid rgb(255 255 255 / 8%);
-  border-radius: 8px;
-  box-shadow: none;
+  border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
 .detail-back {
+  position: relative;
+  z-index: 1;
   justify-self: start;
-  background: rgb(0 0 0 / 28%);
-  border: 1px solid rgb(255 255 255 / 12%);
-  backdrop-filter: blur(14px);
 }
 
 .detail-hero__content {
   display: grid;
-  grid-template-columns: 176px minmax(0, 1fr);
-  gap: 18px;
+  position: relative;
+  z-index: 1;
+  grid-template-columns: 188px minmax(0, 1fr);
+  gap: 22px;
   align-items: end;
-  margin-top: 18px;
+  margin-top: 22px;
 }
 
 .detail-poster {
@@ -578,11 +962,8 @@ function playEpisode(episode: EmbyItem) {
   aspect-ratio: 2 / 3;
   place-items: center;
   overflow: hidden;
-  color: var(--color-muted);
-  background: #111923;
-  border: 1px solid rgb(255 255 255 / 12%);
-  border-radius: 6px;
-  box-shadow: var(--elevation-1);
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  background: rgba(var(--v-theme-on-surface), 0.08);
 }
 
 .detail-poster img {
@@ -599,16 +980,16 @@ function playEpisode(episode: EmbyItem) {
   background: transparent;
   border: 0;
   border-radius: 0;
-  backdrop-filter: none;
 }
 
 .detail-title {
   overflow-wrap: anywhere;
   margin: 0;
   color: #ffffff;
-  font-size: clamp(1.55rem, 3vw, 2.4rem);
-  font-weight: 700;
-  line-height: 1.12;
+  font-size: clamp(1.8rem, 4vw, 3.2rem);
+  font-weight: 500;
+  line-height: 1.06;
+  letter-spacing: -0.03em;
 }
 
 .detail-series,
@@ -617,7 +998,7 @@ function playEpisode(episode: EmbyItem) {
 }
 
 .detail-series {
-  color: #d8e8f7;
+  color: rgb(255 255 255 / 72%);
   font-size: 1rem;
   line-height: 1.45;
 }
@@ -632,28 +1013,24 @@ function playEpisode(episode: EmbyItem) {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 5px 9px;
-  color: #dcecf8;
-  background: color-mix(in srgb, var(--color-secondary-container) 78%, transparent);
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 6px;
+  padding: 6px 11px;
+  color: rgb(255 255 255 / 78%);
+  background: rgb(0 0 0 / 26%);
   font-size: 0.82rem;
 }
 
 .detail-overview {
   max-width: 58rem;
-  color: var(--color-muted);
-  font-size: 0.9rem;
-  line-height: 1.55;
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
+  color: rgb(255 255 255 / 68%);
+  font-size: 0.94rem;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
 }
 
 .detail-play {
   justify-self: start;
   min-width: 136px;
+  box-shadow: none;
 }
 
 .detail-actions {
@@ -671,6 +1048,15 @@ function playEpisode(episode: EmbyItem) {
   opacity: 0.48;
 }
 
+.detail-resume {
+  max-width: 42rem;
+  margin: -4px 0 0;
+  color: #c9d7e3;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .detail-next {
   max-width: 42rem;
   margin: -3px 0 0;
@@ -681,11 +1067,9 @@ function playEpisode(episode: EmbyItem) {
 
 .episode-section {
   display: grid;
-  gap: 12px;
-  padding: 16px;
-  background: color-mix(in srgb, var(--color-panel) 78%, transparent);
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 8px;
+  gap: 16px;
+  padding: 20px;
+  background: rgb(var(--v-theme-surface));
 }
 
 .episode-section__header {
@@ -697,14 +1081,13 @@ function playEpisode(episode: EmbyItem) {
 
 .episode-section__title {
   margin: 0;
-  color: var(--color-text);
-  font-size: 1rem;
-  font-weight: 650;
+  font-size: 1.06rem;
+  font-weight: 500;
   line-height: 1.25;
 }
 
 .episode-section__header span {
-  color: var(--color-muted);
+  color: rgba(var(--v-theme-on-surface), 0.68);
   font-size: 0.82rem;
 }
 
@@ -734,7 +1117,6 @@ function playEpisode(episode: EmbyItem) {
   gap: 7px;
   height: 38px;
   min-width: 0;
-  border-radius: 8px;
   cursor: pointer;
 }
 
@@ -743,13 +1125,13 @@ function playEpisode(episode: EmbyItem) {
   overflow: hidden;
   color: inherit;
   font-size: 0.84rem;
-  font-weight: 700;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .season-tabs__button small {
-  color: color-mix(in srgb, currentColor 72%, transparent);
+  opacity: 0.72;
   font-size: 0.72rem;
 }
 
@@ -764,7 +1146,7 @@ function playEpisode(episode: EmbyItem) {
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 2px 46px 12px;
+  padding: 4px 46px 12px;
   scrollbar-width: none;
   overscroll-behavior-x: contain;
   scroll-snap-type: x proximity;
@@ -788,15 +1170,6 @@ function playEpisode(episode: EmbyItem) {
   z-index: 4;
   width: 38px;
   height: 38px;
-  background: rgb(5 8 12 / 76%);
-  border: 1px solid rgb(255 255 255 / 16%);
-  box-shadow: 0 12px 30px rgb(0 0 0 / 34%);
-  backdrop-filter: blur(16px);
-}
-
-.episode-rail-button:hover {
-  background: color-mix(in srgb, var(--color-primary-container) 82%, black 8%);
-  border-color: color-mix(in srgb, var(--color-signal) 58%, transparent);
 }
 
 .episode-rail-button--previous {
@@ -809,15 +1182,14 @@ function playEpisode(episode: EmbyItem) {
 
 .episode-tile {
   display: grid;
-  flex: 0 0 196px;
+  flex: 0 0 204px;
   gap: 9px;
   min-width: 0;
   padding: 8px;
   color: inherit;
   text-align: left;
-  background: color-mix(in srgb, var(--color-secondary-container) 46%, transparent);
-  border: 1px solid rgb(255 255 255 / 6%);
-  border-radius: 8px;
+  background: rgb(var(--v-theme-surface));
+  border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
   cursor: pointer;
   scroll-snap-align: start;
 }
@@ -828,27 +1200,14 @@ function playEpisode(episode: EmbyItem) {
   aspect-ratio: 16 / 9;
   place-items: center;
   overflow: hidden;
-  color: var(--color-muted);
-  background: #111923;
-  border: 1px solid rgb(255 255 255 / 10%);
-  border-radius: 6px;
-  box-shadow: var(--elevation-1);
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  background: rgba(var(--v-theme-on-surface), 0.08);
 }
 
 .episode-tile__poster img {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transition: transform var(--motion-medium);
-}
-
-.episode-tile__poster::after {
-  position: absolute;
-  inset: 0;
-  content: '';
-  background: linear-gradient(180deg, transparent 42%, rgb(0 0 0 / 50%) 100%);
-  opacity: 0;
-  transition: opacity var(--motion-fast);
 }
 
 .episode-tile__play {
@@ -862,14 +1221,8 @@ function playEpisode(episode: EmbyItem) {
   place-items: center;
   color: #ffffff;
   background: rgb(0 0 0 / 46%);
-  border: 1px solid rgb(255 255 255 / 20%);
-  border-radius: 50%;
   opacity: 0;
   transform: translateY(4px);
-  transition:
-    opacity var(--motion-fast),
-    transform var(--motion-fast);
-  backdrop-filter: blur(14px);
 }
 
 .episode-tile__played {
@@ -881,23 +1234,15 @@ function playEpisode(episode: EmbyItem) {
   width: 24px;
   height: 24px;
   place-items: center;
-  color: #061015;
-  background: var(--color-signal);
-  border: 1px solid rgb(255 255 255 / 42%);
-  border-radius: 999px;
-  box-shadow: 0 8px 20px rgb(0 0 0 / 28%);
+  color: rgb(var(--v-theme-on-primary));
+  background: rgb(var(--v-theme-primary));
 }
 
 .episode-tile:hover .episode-tile__poster {
-  border-color: color-mix(in srgb, var(--color-signal) 64%, transparent);
-  box-shadow: var(--elevation-2);
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: -2px;
 }
 
-.episode-tile:hover .episode-tile__poster img {
-  transform: scale(1.035);
-}
-
-.episode-tile:hover .episode-tile__poster::after,
 .episode-tile:hover .episode-tile__play {
   opacity: 1;
   transform: translateY(0);
@@ -914,32 +1259,26 @@ function playEpisode(episode: EmbyItem) {
 .episode-tile__title,
 .episode-tile__meta {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .episode-tile__index {
-  color: var(--color-signal);
+  color: rgb(var(--v-theme-primary));
   font-size: 0.76rem;
-  font-weight: 700;
+  font-weight: 500;
   line-height: 1.25;
 }
 
 .episode-tile__title {
-  display: -webkit-box;
-  color: var(--color-text);
+  display: block;
   font-size: 0.88rem;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1.28;
-  white-space: normal;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 .episode-tile__meta {
-  color: var(--color-muted);
-  font-size: 0.76rem;
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  font-size: 0.78rem;
   line-height: 1.25;
 }
 
@@ -949,10 +1288,8 @@ function playEpisode(episode: EmbyItem) {
   place-items: center;
   align-content: center;
   gap: 10px;
-  color: var(--color-muted);
-  background: color-mix(in srgb, var(--color-panel) 86%, transparent);
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 8px;
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  background: rgb(var(--v-theme-surface));
 }
 
 .detail-empty {
@@ -961,7 +1298,7 @@ function playEpisode(episode: EmbyItem) {
   place-items: center;
   align-content: center;
   gap: 12px;
-  color: var(--color-muted);
+  color: rgba(var(--v-theme-on-surface), 0.68);
 }
 
 @media (max-width: 820px) {
@@ -981,12 +1318,16 @@ function playEpisode(episode: EmbyItem) {
   }
 
   .episode-tile {
-    flex-basis: 152px;
+    flex-basis: 176px;
+  }
+
+  .episode-rail-button {
+    display: none;
   }
 
   .episode-rail {
-    padding-right: 42px;
-    padding-left: 42px;
+    padding-right: 2px;
+    padding-left: 2px;
   }
 }
 
@@ -1007,10 +1348,6 @@ function playEpisode(episode: EmbyItem) {
   }
 
   .detail-overview {
-    display: -webkit-box;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 5;
     font-size: 0.9rem;
   }
 

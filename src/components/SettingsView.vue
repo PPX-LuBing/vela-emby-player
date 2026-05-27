@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, shallowRef, watch } from 'vue'
-import { Check, Edit3, LogOut, Plus, Trash2, X } from 'lucide-vue-next'
+import { Check, Clipboard, Edit3, LogOut, Plus, Trash2, X } from 'lucide-vue-next'
 import {
   type EmbySession,
   type PlaybackPreferences,
@@ -37,6 +37,7 @@ const emit = defineEmits<{
 
 const isDialogOpen = shallowRef(false)
 const isClearAccountsDialogOpen = shallowRef(false)
+const removingAccount = shallowRef<EmbySession | null>(null)
 const dialogMode = shallowRef<DialogMode>('add')
 const editingAccountId = shallowRef('')
 const form = reactive({
@@ -54,6 +55,18 @@ const playbackPreferenceDraft = reactive<PlaybackPreferences>({
   customMaxStreamingBitrate: props.playbackPreferences.customMaxStreamingBitrate,
 })
 const customMaxStreamingMbpsDraft = shallowRef(bitrateToMbps(props.playbackPreferences.customMaxStreamingBitrate))
+const audioLanguageDraft = shallowRef(languageStringToChips(props.playbackPreferences.preferredAudioLanguage))
+const subtitleLanguageDraft = shallowRef(languageStringToChips(props.playbackPreferences.preferredSubtitleLanguage))
+const errorCopyLabel = shallowRef('复制错误')
+const languageSuggestions = [
+  'chi',
+  'zho',
+  'chinese',
+  'eng',
+  'jpn',
+  'kor',
+  'und',
+]
 
 const dialogTitle = computed(() =>
   dialogMode.value === 'add' ? '添加 Emby 服务' : '编辑服务器',
@@ -87,6 +100,8 @@ watch(
     playbackPreferenceDraft.defaultForceTranscode = nextPreferences.defaultForceTranscode
     playbackPreferenceDraft.defaultQualityPreset = nextPreferences.defaultQualityPreset
     playbackPreferenceDraft.customMaxStreamingBitrate = nextPreferences.customMaxStreamingBitrate
+    audioLanguageDraft.value = languageStringToChips(nextPreferences.preferredAudioLanguage)
+    subtitleLanguageDraft.value = languageStringToChips(nextPreferences.preferredSubtitleLanguage)
     customMaxStreamingMbpsDraft.value = bitrateToMbps(nextPreferences.customMaxStreamingBitrate)
   },
 )
@@ -148,8 +163,8 @@ function resetPlaybackUserAgent() {
 
 function savePlaybackPreferences() {
   emit('updatePlaybackPreferences', {
-    preferredAudioLanguage: playbackPreferenceDraft.preferredAudioLanguage,
-    preferredSubtitleLanguage: playbackPreferenceDraft.preferredSubtitleLanguage,
+    preferredAudioLanguage: languageChipsToString(audioLanguageDraft.value),
+    preferredSubtitleLanguage: languageChipsToString(subtitleLanguageDraft.value),
     defaultForceTranscode: playbackPreferenceDraft.defaultForceTranscode,
     defaultQualityPreset: playbackPreferenceDraft.defaultQualityPreset,
     customMaxStreamingBitrate: mbpsToBitrate(customMaxStreamingMbpsDraft.value),
@@ -159,6 +174,8 @@ function savePlaybackPreferences() {
 function resetPlaybackPreferences() {
   playbackPreferenceDraft.preferredAudioLanguage = ''
   playbackPreferenceDraft.preferredSubtitleLanguage = ''
+  audioLanguageDraft.value = []
+  subtitleLanguageDraft.value = []
   playbackPreferenceDraft.defaultForceTranscode = false
   playbackPreferenceDraft.defaultQualityPreset = 'original'
   playbackPreferenceDraft.customMaxStreamingBitrate = 12_000_000
@@ -169,6 +186,47 @@ function resetPlaybackPreferences() {
 function confirmClearLocalAccounts() {
   isClearAccountsDialogOpen.value = false
   emit('clearLocalAccounts')
+}
+
+function openRemoveAccountDialog(account: EmbySession) {
+  removingAccount.value = account
+}
+
+function closeRemoveAccountDialog() {
+  removingAccount.value = null
+}
+
+function confirmRemoveAccount() {
+  const accountId = removingAccount.value?.id
+  if (!accountId) {
+    return
+  }
+
+  emit('removeAccount', accountId)
+  closeRemoveAccountDialog()
+}
+
+async function copyErrorMessage() {
+  if (!props.errorMessage) {
+    return
+  }
+
+  await navigator.clipboard.writeText(props.errorMessage)
+  errorCopyLabel.value = '已复制'
+  window.setTimeout(() => {
+    errorCopyLabel.value = '复制错误'
+  }, 1800)
+}
+
+function languageStringToChips(value: string) {
+  return value
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function languageChipsToString(value: readonly string[]) {
+  return [...new Set(value.map((item) => item.trim().toLowerCase()).filter(Boolean))].join(', ')
 }
 </script>
 
@@ -222,6 +280,7 @@ function confirmClearLocalAccounts() {
               icon
               variant="tonal"
               size="small"
+              aria-label="切换到该服务器"
               :disabled="session?.id === account.id || isBusy"
               title="切换"
               @click="emit('switchAccount', account.id)"
@@ -233,6 +292,7 @@ function confirmClearLocalAccounts() {
               icon
               variant="tonal"
               size="small"
+              aria-label="编辑服务器"
               title="编辑"
               @click="openEditDialog(account)"
             >
@@ -244,8 +304,9 @@ function confirmClearLocalAccounts() {
               variant="tonal"
               size="small"
               color="error"
+              aria-label="删除服务器"
               title="删除"
-              @click="emit('removeAccount', account.id)"
+              @click="openRemoveAccountDialog(account)"
             >
               <Trash2 :size="16" />
             </VBtn>
@@ -297,18 +358,26 @@ function confirmClearLocalAccounts() {
       </div>
 
       <div class="playback-preferences-form">
-        <VTextField
-          v-model.trim="playbackPreferenceDraft.preferredAudioLanguage"
+        <VCombobox
+          v-model="audioLanguageDraft"
           label="默认音轨语言"
+          :items="languageSuggestions"
           placeholder="例如：chi / zho / eng / jpn"
+          multiple
+          chips
+          closable-chips
           density="comfortable"
           variant="solo-filled"
           hide-details
         />
-        <VTextField
-          v-model.trim="playbackPreferenceDraft.preferredSubtitleLanguage"
+        <VCombobox
+          v-model="subtitleLanguageDraft"
           label="默认字幕语言"
+          :items="languageSuggestions"
           placeholder="留空则默认关闭字幕"
+          multiple
+          chips
+          closable-chips
           density="comfortable"
           variant="solo-filled"
           hide-details
@@ -330,18 +399,35 @@ function confirmClearLocalAccounts() {
           variant="solo-filled"
           hide-details
         />
-        <VTextField
+        <div
           v-if="playbackPreferenceDraft.defaultQualityPreset === 'custom'"
-          v-model.number="customMaxStreamingMbpsDraft"
-          label="自定义最大码率（Mbps）"
-          type="number"
-          min="1"
-          max="120"
-          step="1"
-          density="comfortable"
-          variant="solo-filled"
-          hide-details
-        />
+          class="playback-preferences-form__custom-quality"
+        >
+          <div class="custom-quality__header">
+            <span>自定义最大码率</span>
+            <strong>{{ customMaxStreamingMbpsDraft }} Mbps</strong>
+          </div>
+          <VSlider
+            v-model="customMaxStreamingMbpsDraft"
+            :min="1"
+            :max="120"
+            :step="1"
+            color="primary"
+            thumb-label
+            hide-details
+          />
+          <VTextField
+            v-model.number="customMaxStreamingMbpsDraft"
+            label="精确输入（Mbps）"
+            type="number"
+            min="1"
+            max="120"
+            step="1"
+            density="comfortable"
+            variant="solo-filled"
+            hide-details
+          />
+        </div>
         <div class="playback-agent-form__actions">
           <VBtn variant="tonal" type="button" @click="resetPlaybackPreferences">
             恢复默认
@@ -380,13 +466,35 @@ function confirmClearLocalAccounts() {
       </p>
     </VCard>
 
-    <VAlert v-if="errorMessage" type="error" variant="tonal">{{ errorMessage }}</VAlert>
+    <VAlert v-if="errorMessage" type="error" variant="tonal">
+      <div class="settings-error">
+        <span>{{ errorMessage }}</span>
+        <div class="settings-error__actions">
+          <VBtn size="small" variant="tonal" type="button" @click="copyErrorMessage">
+            <template #prepend>
+              <Clipboard :size="15" />
+            </template>
+            {{ errorCopyLabel }}
+          </VBtn>
+          <VBtn
+            size="small"
+            color="error"
+            variant="tonal"
+            type="button"
+            :disabled="isBusy || accounts.length === 0"
+            @click="isClearAccountsDialogOpen = true"
+          >
+            清除本地账号
+          </VBtn>
+        </div>
+      </div>
+    </VAlert>
 
     <VDialog v-model="isDialogOpen" max-width="460">
       <VCard class="server-dialog">
         <div class="server-dialog__header">
           <h3>{{ dialogTitle }}</h3>
-          <VBtn icon variant="tonal" size="small" type="button" @click="isDialogOpen = false">
+          <VBtn icon variant="tonal" size="small" type="button" aria-label="关闭服务器表单" @click="isDialogOpen = false">
             <X :size="17" />
           </VBtn>
         </div>
@@ -442,7 +550,7 @@ function confirmClearLocalAccounts() {
       <VCard class="server-dialog">
         <div class="server-dialog__header">
           <h3>清除本地账号？</h3>
-          <VBtn icon variant="tonal" size="small" type="button" @click="isClearAccountsDialogOpen = false">
+          <VBtn icon variant="tonal" size="small" type="button" aria-label="关闭清除账号确认" @click="isClearAccountsDialogOpen = false">
             <X :size="17" />
           </VBtn>
         </div>
@@ -461,6 +569,30 @@ function confirmClearLocalAccounts() {
         </div>
       </VCard>
     </VDialog>
+
+    <VDialog :model-value="Boolean(removingAccount)" max-width="440" @update:model-value="closeRemoveAccountDialog">
+      <VCard class="server-dialog">
+        <div class="server-dialog__header">
+          <h3>删除服务器？</h3>
+          <VBtn icon variant="tonal" size="small" type="button" aria-label="关闭删除服务器确认" @click="closeRemoveAccountDialog">
+            <X :size="17" />
+          </VBtn>
+        </div>
+
+        <p class="settings-note">
+          这只会删除本机保存的 {{ removingAccount?.displayName || '该服务器' }} 登录信息，不会删除 Emby 服务器上的账号。
+        </p>
+
+        <div class="server-dialog__actions">
+          <VBtn variant="tonal" type="button" @click="closeRemoveAccountDialog">
+            取消
+          </VBtn>
+          <VBtn color="error" type="button" :loading="isBusy" @click="confirmRemoveAccount">
+            确认删除
+          </VBtn>
+        </div>
+      </VCard>
+    </VDialog>
   </section>
 </template>
 
@@ -468,9 +600,8 @@ function confirmClearLocalAccounts() {
 .settings-view {
   display: grid;
   align-content: start;
-  gap: 14px;
-  max-width: 860px;
-  animation: surface-enter var(--motion-emphasized) both;
+  gap: 16px;
+  max-width: 920px;
 }
 
 .settings-view__header,
@@ -484,29 +615,25 @@ function confirmClearLocalAccounts() {
 .settings-card {
   display: grid;
   gap: 12px;
-  padding: 16px;
-  background: color-mix(in srgb, var(--color-panel) 86%, transparent);
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 10px;
-  box-shadow: none;
+  padding: 18px;
+  background: rgb(var(--v-theme-surface));
 }
 
 .settings-card--danger {
-  border-color: color-mix(in srgb, rgb(var(--v-theme-error)) 28%, rgb(255 255 255 / 7%));
+  outline: 1px solid rgba(var(--v-theme-error), 0.35);
 }
 
 .settings-card__heading h3 {
   margin: 0;
-  color: var(--color-text);
-  font-size: 1rem;
-  font-weight: 650;
+  font-size: 1.02rem;
+  font-weight: 500;
   line-height: 1.25;
 }
 
 .settings-card__heading p,
 .settings-note {
   margin: 4px 0 0;
-  color: var(--color-muted);
+  color: rgba(var(--v-theme-on-surface), 0.68);
   font-size: 0.84rem;
   line-height: 1.4;
 }
@@ -526,9 +653,41 @@ function confirmClearLocalAccounts() {
   align-self: center;
 }
 
+.playback-preferences-form__custom-quality {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+  padding: 12px;
+  background: rgb(var(--v-theme-surface));
+}
+
+.custom-quality__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  font-size: 0.84rem;
+}
+
+.custom-quality__header strong {
+  font-weight: 500;
+}
+
 .playback-agent-form__actions {
   display: flex;
   justify-content: end;
+  gap: 8px;
+}
+
+.settings-error {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-error__actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -544,22 +703,12 @@ function confirmClearLocalAccounts() {
   gap: 16px;
   min-height: 60px;
   padding: 12px 14px;
-  background: color-mix(in srgb, var(--color-secondary-container) 52%, transparent);
-  border: 1px solid rgb(255 255 255 / 6%);
-  border-radius: 8px;
-  transition:
-    background-color var(--motion-fast),
-    border-color var(--motion-fast),
-    transform var(--motion-fast);
-}
-
-.account-row:hover {
-  background: color-mix(in srgb, var(--color-secondary-container) 78%, transparent);
-  transform: translateY(-1px);
+  background: rgb(var(--v-theme-surface));
+  border: thin solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
 .account-row--active {
-  border-color: color-mix(in srgb, var(--color-signal) 55%, transparent);
+  border-color: rgb(var(--v-theme-primary));
 }
 
 .account-row__main {
@@ -569,9 +718,7 @@ function confirmClearLocalAccounts() {
 }
 
 .account-row__main strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .account-row__main span {
@@ -579,15 +726,14 @@ function confirmClearLocalAccounts() {
 }
 
 .account-row__main strong {
-  color: var(--color-text);
   font-size: 0.98rem;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.3;
 }
 
 .account-row__main span,
 .empty-settings {
-  color: var(--color-muted);
+  color: rgba(var(--v-theme-on-surface), 0.68);
   font-size: 0.84rem;
   line-height: 1.35;
 }
@@ -602,11 +748,7 @@ function confirmClearLocalAccounts() {
   display: grid;
   gap: 16px;
   padding: 18px;
-  background: var(--color-panel);
-  border: 1px solid rgb(255 255 255 / 12%);
-  border-radius: 10px;
-  box-shadow: var(--elevation-3);
-  animation: dialog-enter var(--motion-emphasized) both;
+  background: rgb(var(--v-theme-surface));
 }
 
 .server-dialog__form {
@@ -624,25 +766,13 @@ function confirmClearLocalAccounts() {
 
 .server-dialog__header h3 {
   margin: 0;
-  color: var(--color-text);
   font-size: 1.32rem;
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.25;
 }
 
 .server-dialog__actions {
   justify-content: end;
-}
-
-@keyframes dialog-enter {
-  from {
-    opacity: 0;
-    transform: translateY(16px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
 }
 
 @media (max-width: 620px) {

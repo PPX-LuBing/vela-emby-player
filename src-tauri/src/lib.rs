@@ -1,8 +1,11 @@
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::os::raw::{c_char, c_double, c_int, c_ulonglong, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::window::WindowBuilder;
@@ -10,6 +13,10 @@ use tauri::{Manager, Window, WindowEvent};
 
 const SECURE_STORAGE_SERVICE: &str = "app.vela.emby-player";
 const SECURE_STORAGE_ACCOUNTS_KEY: &str = "accounts";
+const LOCAL_ACCOUNTS_FILE: &str = "accounts.v1.bin";
+const LOCAL_ACCOUNTS_KEY_FILE: &str = "accounts.v1.key";
+const LOCAL_ACCOUNTS_MAGIC: &[u8] = b"VELA_ACCOUNTS_V1";
+static KEYRING_STORE_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +38,11 @@ struct MpvPlayRequest {
 struct HttpHeader {
     name: String,
     value: String,
+}
+
+struct ValidHttpHeader<'a> {
+    name: &'a str,
+    value: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -219,7 +231,10 @@ fn play_media(
 }
 
 #[tauri::command]
-fn play_with_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Result<MpvPlayResponse, String> {
+fn play_with_mpv(
+    app: tauri::AppHandle,
+    request: MpvPlayRequest,
+) -> Result<MpvPlayResponse, String> {
     play_with_sidecar_mpv(app, request)
 }
 
@@ -335,36 +350,258 @@ fn player_engine_status(app: tauri::AppHandle) -> PlayerEngineStatus {
 }
 
 #[tauri::command]
+fn read_local_accounts(app: tauri::AppHandle) -> Result<SecureStoragePayload, String> {
+    let path = local_accounts_path(&app)?;
+    if !path.is_file() {
+        return Ok(SecureStoragePayload { value: None });
+    }
+
+    let encrypted = fs::read(&path).map_err(|error| format!("读取本地账号文件失败：{error}"))?;
+    if encrypted.is_empty() {
+        return Ok(SecureStoragePayload { value: None });
+    }
+
+    let key = local_accounts_key(&app)?;
+    let value = decrypt_local_accounts(&key, &encrypted)?;
+    Ok(SecureStoragePayload { value: Some(value) })
+}
+
+#[tauri::command]
+fn write_local_accounts(app: tauri::AppHandle, value: String) -> Result<(), String> {
+    let data_dir = local_accounts_dir(&app)?;
+    fs::create_dir_all(&data_dir).map_err(|error| format!("创建本地账号目录失败：{error}"))?;
+
+    let key = local_accounts_key(&app)?;
+    let encrypted = encrypt_local_accounts(&key, value.as_bytes())?;
+    write_private_file(
+        &data_dir.join(LOCAL_ACCOUNTS_FILE),
+        &encrypted,
+        "写入本地账号文件失败",
+    )
+}
+
+#[tauri::command]
+fn delete_local_accounts(app: tauri::AppHandle) -> Result<(), String> {
+    let path = local_accounts_path(&app)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除本地账号文件失败：{error}")),
+    }
+}
+
+#[tauri::command]
 fn read_secure_accounts() -> Result<SecureStoragePayload, String> {
-    match keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY).get_password() {
+    let entry = keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY)?;
+    match entry.get_password() {
         Ok(value) => Ok(SecureStoragePayload { value: Some(value) }),
-        Err(keyring::Error::NoEntry) => Ok(SecureStoragePayload { value: None }),
+        Err(keyring_core::Error::NoEntry) => Ok(SecureStoragePayload { value: None }),
         Err(error) => Err(format!("读取系统安全存储失败：{error}")),
     }
 }
 
 #[tauri::command]
 fn write_secure_accounts(value: String) -> Result<(), String> {
-    keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY)
-        .set_password(&value)
-        .map_err(|error| format!("写入系统安全存储失败：{error}"))
+    let entry = keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY)?;
+    match entry.set_password(&value) {
+        Ok(()) => Ok(()),
+        Err(error) if is_duplicate_keychain_item_error(&error) => {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring_core::Error::NoEntry) => {}
+                Err(delete_error) => {
+                    return Err(format!(
+                        "更新系统安全存储失败：删除旧凭据失败：{delete_error}"
+                    ))
+                }
+            }
+
+            entry
+                .set_password(&value)
+                .map_err(|retry_error| format!("更新系统安全存储失败：{retry_error}"))
+        }
+        Err(error) => Err(format!("写入系统安全存储失败：{error}")),
+    }
 }
 
 #[tauri::command]
 fn delete_secure_accounts() -> Result<(), String> {
-    match keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY).delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+    let entry = keyring_entry(SECURE_STORAGE_ACCOUNTS_KEY)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(format!("删除系统安全存储失败：{error}")),
     }
 }
 
-fn keyring_entry(key: &str) -> keyring::Entry {
-    keyring::Entry::new(SECURE_STORAGE_SERVICE, key)
-        .expect("static keyring service/account values should be valid")
+fn keyring_entry(key: &str) -> Result<keyring_core::Entry, String> {
+    ensure_keyring_store()?;
+    keyring_core::Entry::new(SECURE_STORAGE_SERVICE, key)
+        .map_err(|error| format!("创建系统安全存储条目失败：{error}"))
 }
 
-fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Result<MpvPlayResponse, String> {
+fn ensure_keyring_store() -> Result<(), String> {
+    let mut initialized = KEYRING_STORE_INITIALIZED
+        .lock()
+        .map_err(|_| "初始化系统安全存储失败：初始化锁已损坏".to_string())?;
+    if *initialized {
+        return Ok(());
+    }
+
+    init_keyring_store()?;
+    *initialized = true;
+    Ok(())
+}
+
+fn init_keyring_store() -> Result<(), String> {
+    init_native_keyring_store().map_err(|error| format!("初始化系统安全存储失败：{error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn init_native_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn init_native_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn init_native_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn init_native_keyring_store() -> keyring_core::Result<()> {
+    Err(keyring_core::Error::NotSupportedByStore(
+        "当前平台没有配置系统安全存储后端".to_string(),
+    ))
+}
+
+fn is_duplicate_keychain_item_error(error: &keyring_core::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("already exists") || message.contains("duplicate")
+}
+
+fn local_accounts_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))
+}
+
+fn local_accounts_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(local_accounts_dir(app)?.join(LOCAL_ACCOUNTS_FILE))
+}
+
+fn local_accounts_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(local_accounts_dir(app)?.join(LOCAL_ACCOUNTS_KEY_FILE))
+}
+
+fn local_accounts_key(app: &tauri::AppHandle) -> Result<[u8; 32], String> {
+    let data_dir = local_accounts_dir(app)?;
+    fs::create_dir_all(&data_dir).map_err(|error| format!("创建本地账号目录失败：{error}"))?;
+
+    let key_path = local_accounts_key_path(app)?;
+    if key_path.is_file() {
+        let key = fs::read(&key_path).map_err(|error| format!("读取本地账号密钥失败：{error}"))?;
+        return key
+            .try_into()
+            .map_err(|_| "本地账号密钥长度无效".to_string());
+    }
+
+    let mut key = [0_u8; 32];
+    rand::fill(&mut key);
+    write_private_file(&key_path, &key, "写入本地账号密钥失败")?;
+    Ok(key)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| format!("{context}：{error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("{context}：{error}"))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes).map_err(|error| format!("{context}：{error}"))?;
+    }
+
+    restrict_owner_permissions(path)
+}
+
+fn encrypt_local_accounts(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|error| format!("初始化本地加密失败：{error}"))?;
+    let mut nonce_bytes = [0_u8; 12];
+    rand::fill(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|error| format!("加密本地账号失败：{error}"))?;
+
+    let mut output =
+        Vec::with_capacity(LOCAL_ACCOUNTS_MAGIC.len() + nonce_bytes.len() + ciphertext.len());
+    output.extend_from_slice(LOCAL_ACCOUNTS_MAGIC);
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
+}
+
+fn decrypt_local_accounts(key: &[u8; 32], encrypted: &[u8]) -> Result<String, String> {
+    let prefix_len = LOCAL_ACCOUNTS_MAGIC.len();
+    let nonce_len = 12;
+    if encrypted.len() <= prefix_len + nonce_len || &encrypted[..prefix_len] != LOCAL_ACCOUNTS_MAGIC
+    {
+        return Err("本地账号文件格式无效".to_string());
+    }
+
+    let nonce = Nonce::from_slice(&encrypted[prefix_len..prefix_len + nonce_len]);
+    let ciphertext = &encrypted[prefix_len + nonce_len..];
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|error| format!("初始化本地解密失败：{error}"))?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|error| format!("解密本地账号失败：{error}"))?;
+    String::from_utf8(plaintext).map_err(|error| format!("本地账号内容不是有效 UTF-8：{error}"))
+}
+
+fn restrict_owner_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| format!("设置本地账号文件权限失败：{error}"))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+fn play_with_sidecar_mpv(
+    app: tauri::AppHandle,
+    request: MpvPlayRequest,
+) -> Result<MpvPlayResponse, String> {
     let mpv_path = resolve_mpv_path(&app, request.mpv_path.as_deref())?;
+    let headers = validate_http_headers(&request.headers)?;
 
     let mut command = Command::new(mpv_path);
     command
@@ -373,7 +610,12 @@ fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Resu
         .arg("--keep-open=no")
         .arg("--idle=no");
 
-    if let Some(title) = request.title.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(title) = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         command.arg(format!("--title={title}"));
     }
 
@@ -391,13 +633,13 @@ fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Resu
         command.arg("--sid=no");
     }
 
-    if let Some(user_agent) = user_agent_from_headers(&request.headers) {
+    if let Some(user_agent) = user_agent_from_headers(&headers) {
         command.arg(format!("--user-agent={user_agent}"));
     }
 
-    for header in request.headers {
-        let name = header.name.trim();
-        let value = header.value.trim();
+    for header in headers {
+        let name = header.name;
+        let value = header.value;
         if !name.eq_ignore_ascii_case("User-Agent") && !name.is_empty() && !value.is_empty() {
             command.arg(format!("--http-header-fields={name}: {value}"));
         }
@@ -424,12 +666,66 @@ fn play_with_sidecar_mpv(app: tauri::AppHandle, request: MpvPlayRequest) -> Resu
     })
 }
 
-fn user_agent_from_headers(headers: &[HttpHeader]) -> Option<String> {
-    headers.iter().find_map(|header| {
-        let name = header.name.trim();
-        let value = header.value.trim();
-        (name.eq_ignore_ascii_case("User-Agent") && !value.is_empty()).then(|| value.to_string())
-    })
+fn user_agent_from_headers<'a>(headers: &'a [ValidHttpHeader<'a>]) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("User-Agent") && !header.value.is_empty())
+        .map(|header| header.value)
+}
+
+fn validate_http_headers(headers: &[HttpHeader]) -> Result<Vec<ValidHttpHeader<'_>>, String> {
+    headers
+        .iter()
+        .filter_map(|header| {
+            let name = header.name.trim();
+            let value = header.value.trim();
+            (!name.is_empty() && !value.is_empty()).then_some((name, value))
+        })
+        .map(|(name, value)| {
+            validate_http_header_name(name)?;
+            validate_http_header_value(name, value)?;
+            Ok(ValidHttpHeader { name, value })
+        })
+        .collect()
+}
+
+fn validate_http_header_name(name: &str) -> Result<(), String> {
+    if name.bytes().all(is_http_token_char) {
+        return Ok(());
+    }
+
+    Err(format!("mpv HTTP header 名称无效：{name}"))
+}
+
+fn validate_http_header_value(name: &str, value: &str) -> Result<(), String> {
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(format!("mpv HTTP header {name} 的值包含非法控制字符"));
+    }
+
+    Ok(())
+}
+
+fn is_http_token_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
 }
 
 pub fn run() {
@@ -446,6 +742,9 @@ pub fn run() {
             set_player_volume,
             control_player,
             player_engine_status,
+            read_local_accounts,
+            write_local_accounts,
+            delete_local_accounts,
             read_secure_accounts,
             write_secure_accounts,
             delete_secure_accounts
@@ -464,7 +763,9 @@ fn play_with_libmpv(
         .lock()
         .map_err(|_| "libmpv 状态锁定失败".to_string())?;
 
-    let requested_mode = request.render_mode.unwrap_or(PlayerRenderMode::EmbeddedWindow);
+    let requested_mode = request
+        .render_mode
+        .unwrap_or(PlayerRenderMode::EmbeddedWindow);
     let needs_recreate = guard
         .as_ref()
         .is_some_and(|player| player.render_mode != requested_mode);
@@ -474,7 +775,11 @@ fn play_with_libmpv(
     }
 
     if guard.is_none() {
-        *guard = Some(LibMpvPlayer::new(app, request.embed_bounds, requested_mode)?);
+        *guard = Some(LibMpvPlayer::new(
+            app,
+            request.embed_bounds,
+            requested_mode,
+        )?);
     } else if let Some(bounds) = request.embed_bounds {
         if let Some(window) = app.get_window("video-player") {
             apply_player_bounds(&window, bounds)?;
@@ -740,7 +1045,14 @@ impl LibMpvPlayer {
     }
 
     fn play(&mut self, request: &MpvPlayRequest) -> Result<(), String> {
-        if let Some(title) = request.title.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let validated_headers = validate_http_headers(&request.headers)?;
+
+        if let Some(title) = request
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             self.set_option("title", title)?;
         }
 
@@ -758,16 +1070,15 @@ impl LibMpvPlayer {
             self.set_option("sid", "no")?;
         }
 
-        if let Some(user_agent) = user_agent_from_headers(&request.headers) {
-            self.set_option("user-agent", &user_agent)?;
+        if let Some(user_agent) = user_agent_from_headers(&validated_headers) {
+            self.set_option("user-agent", user_agent)?;
         }
 
-        let headers = request
-            .headers
+        let headers = validated_headers
             .iter()
             .filter_map(|header| {
-                let name = header.name.trim();
-                let value = header.value.trim();
+                let name = header.name;
+                let value = header.value;
                 (!name.eq_ignore_ascii_case("User-Agent") && !name.is_empty() && !value.is_empty())
                     .then(|| format!("{name}: {value}"))
             })
@@ -793,8 +1104,10 @@ impl LibMpvPlayer {
 
     fn set_option(&self, name: &str, value: &str) -> Result<(), String> {
         let name = CString::new(name).map_err(|_| "libmpv option name 包含空字节".to_string())?;
-        let value = CString::new(value).map_err(|_| "libmpv option value 包含空字节".to_string())?;
-        let code = unsafe { (self.api.set_option_string)(self.handle, name.as_ptr(), value.as_ptr()) };
+        let value =
+            CString::new(value).map_err(|_| "libmpv option value 包含空字节".to_string())?;
+        let code =
+            unsafe { (self.api.set_option_string)(self.handle, name.as_ptr(), value.as_ptr()) };
         if code >= 0 {
             return Ok(());
         }
@@ -845,15 +1158,21 @@ impl LibMpvApi {
             .map_err(|error| format!("无法加载 libmpv {}：{error}", path.display()))?;
 
         unsafe {
-            let create = *library.get::<MpvCreate>(b"mpv_create\0").map_err(|error| error.to_string())?;
-            let initialize = *library.get::<MpvInitialize>(b"mpv_initialize\0").map_err(|error| error.to_string())?;
+            let create = *library
+                .get::<MpvCreate>(b"mpv_create\0")
+                .map_err(|error| error.to_string())?;
+            let initialize = *library
+                .get::<MpvInitialize>(b"mpv_initialize\0")
+                .map_err(|error| error.to_string())?;
             let terminate_destroy = *library
                 .get::<MpvTerminateDestroy>(b"mpv_terminate_destroy\0")
                 .map_err(|error| error.to_string())?;
             let set_option_string = *library
                 .get::<MpvSetOptionString>(b"mpv_set_option_string\0")
                 .map_err(|error| error.to_string())?;
-            let command = *library.get::<MpvCommand>(b"mpv_command\0").map_err(|error| error.to_string())?;
+            let command = *library
+                .get::<MpvCommand>(b"mpv_command\0")
+                .map_err(|error| error.to_string())?;
             let error_string = *library
                 .get::<MpvErrorString>(b"mpv_error_string\0")
                 .map_err(|error| error.to_string())?;
@@ -903,8 +1222,14 @@ impl LibMpvApi {
     }
 }
 
-fn resolve_mpv_path(app: &tauri::AppHandle, configured_path: Option<&str>) -> Result<PathBuf, String> {
-    if let Some(path) = configured_path.map(str::trim).filter(|value| !value.is_empty()) {
+fn resolve_mpv_path(
+    app: &tauri::AppHandle,
+    configured_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = configured_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return Ok(PathBuf::from(path));
     }
 
@@ -956,14 +1281,18 @@ fn bundled_libmpv_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.extend(platform_libmpv_candidates(resource_dir.join("vendor").join("libmpv")));
+        candidates.extend(platform_libmpv_candidates(
+            resource_dir.join("vendor").join("libmpv"),
+        ));
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.extend(platform_libmpv_candidates(
             current_dir.join("src-tauri").join("vendor").join("libmpv"),
         ));
-        candidates.extend(platform_libmpv_candidates(current_dir.join("vendor").join("libmpv")));
+        candidates.extend(platform_libmpv_candidates(
+            current_dir.join("vendor").join("libmpv"),
+        ));
     }
 
     candidates
@@ -977,7 +1306,9 @@ fn bundled_mpv_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
-        candidates.extend(platform_candidates(current_dir.join("src-tauri").join("vendor").join("mpv")));
+        candidates.extend(platform_candidates(
+            current_dir.join("src-tauri").join("vendor").join("mpv"),
+        ));
         candidates.extend(platform_candidates(current_dir.join("vendor").join("mpv")));
     }
 
@@ -1000,7 +1331,9 @@ fn resolve_player_window_id(
     #[cfg(target_os = "windows")]
     {
         let window = player_window(app, bounds)?;
-        let hwnd = window.hwnd().map_err(|error| format!("无法获取播放器 HWND：{error}"))?;
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("无法获取播放器 HWND：{error}"))?;
         return Ok(Some((hwnd.0 as usize).to_string()));
     }
 
@@ -1010,7 +1343,10 @@ fn resolve_player_window_id(
     }
 }
 
-fn player_window(app: &tauri::AppHandle, bounds: Option<EmbeddedPlayerBounds>) -> Result<Window, String> {
+fn player_window(
+    app: &tauri::AppHandle,
+    bounds: Option<EmbeddedPlayerBounds>,
+) -> Result<Window, String> {
     const PLAYER_LABEL: &str = "video-player";
 
     if let Some(window) = app.get_window(PLAYER_LABEL) {
@@ -1075,7 +1411,11 @@ fn platform_candidates(base: PathBuf) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         vec![
-            base.join("macos").join("mpv.app").join("Contents").join("MacOS").join("mpv"),
+            base.join("macos")
+                .join("mpv.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("mpv"),
             base.join("macos").join("mpv"),
         ]
     }
@@ -1107,6 +1447,9 @@ fn platform_libmpv_candidates(base: PathBuf) -> Vec<PathBuf> {
 
     #[cfg(target_os = "linux")]
     {
-        vec![base.join("linux").join("libmpv.so.2"), base.join("linux").join("libmpv.so")]
+        vec![
+            base.join("linux").join("libmpv.so.2"),
+            base.join("linux").join("libmpv.so"),
+        ]
     }
 }
